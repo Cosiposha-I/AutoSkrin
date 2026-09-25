@@ -3,7 +3,7 @@ ui.py — графический интерфейс AutoSkrin (PyQt6).
 
 Состав:
     make_icon_pixmap / app_icon — иконка приложения (рисуется кодом);
-    GlobalHotkey                 — глобальная горячая клавиша (Ctrl+Shift+S);
+    GlobalHotkey                 — глобальная горячая клавиша (по умолчанию Ctrl+Alt+S);
     MainWindow                   — главное окно, иконка в трее, лог событий.
 """
 
@@ -18,19 +18,22 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import (QAbstractNativeEventFilter, QCoreApplication, QObject, QPointF, QRectF,
-                          Qt, QTimer, QUrl, pyqtSignal)
+                          Qt, QTime, QTimer, QUrl, pyqtSignal)
 from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QIcon, QKeySequence, QLinearGradient,
                          QPainter, QPen, QPixmap, QShortcut)
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-                             QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                             QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-                             QSpinBox, QStyle, QSystemTrayIcon, QVBoxLayout, QWidget)
+                             QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+                             QKeySequenceEdit, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
+                             QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QStyle,
+                             QSystemTrayIcon, QTimeEdit, QVBoxLayout, QWidget)
 
-from monitor import ScreenMonitor
+from monitor import ScreenMonitor, format_duration, timer_deadline
 from region_selector import RegionHighlighter, RegionSelector, region_on_screens
 from settings import (APP_NAME, APP_VERSION, CAPTURE_ALL, CAPTURE_REGION, CAPTURE_SCREEN,
-                      Region, Settings, autorun_supported, check_folder_writable,
-                      get_config_path, is_autorun_enabled, save_settings, set_autorun)
+                      DEFAULT_HOTKEY, TIMER_AFTER, TIMER_AT, Region, Settings, autorun_supported,
+                      check_docx_target, check_folder_writable, get_config_path,
+                      is_autorun_enabled, parse_hhmm, save_settings, set_autorun)
+from word_doc import ensure_document
 
 log = logging.getLogger(__name__)
 
@@ -255,7 +258,10 @@ class MainWindow(QMainWindow):
         self.monitor: ScreenMonitor | None = None
         self._threads: set[ScreenMonitor] = set()   # потоки, которые ещё завершаются
         self.shot_count = 0
-        self.last_file: str | None = None
+        self.last_target = ""                  # файл/документ последнего снимка (щелчок по уведомлению)
+        self._monitor_started: datetime | None = None
+        self._deadline: datetime | None = None  # когда остановить мониторинг по таймеру
+        self._local_shortcut: QShortcut | None = None
         self._quitting = False
         self._loading = False
         self._tray_hint_shown = False
@@ -267,6 +273,10 @@ class MainWindow(QMainWindow):
         # Отложенное сохранение настроек (чтобы не писать файл на каждый щелчок спинбокса)
         self._save_timer = QTimer(self, singleShot=True, interval=400)
         self._save_timer.timeout.connect(self._save_settings_now)
+
+        # Обратный отсчёт таймера автоматической остановки (раз в секунду)
+        self._countdown = QTimer(self, interval=1000)
+        self._countdown.timeout.connect(self._on_countdown)
 
         self._selector = RegionSelector(self)
         self._selector.region_selected.connect(self._on_region_selected)
@@ -281,7 +291,7 @@ class MainWindow(QMainWindow):
         self._build_tray()
         self._load_values()
         self._update_state()
-        self.resize(1000, 660)
+        self.resize(1060, 720)
 
         self._log(f"{APP_NAME} {APP_VERSION} запущен")
         self._log(f"Файл настроек: {get_config_path()}")
@@ -324,16 +334,25 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.select_btn, 2)
         buttons.addWidget(self.show_region_btn, 1)
         root.addLayout(buttons)
+        root.addLayout(self._build_timer_row())
 
-        # --- Две колонки: настройки слева, журнал справа ---
+        # --- Две колонки: настройки слева (с прокруткой на маленьких экранах), журнал справа ---
         columns = QHBoxLayout()
-        left = QVBoxLayout()
+        left_widget = QWidget()
+        left = QVBoxLayout(left_widget)
+        left.setContentsMargins(0, 0, 6, 0)
         left.addWidget(self._build_region_group())
         left.addWidget(self._build_save_group())
         left.addWidget(self._build_detection_group())
         left.addWidget(self._build_options_group())
         left.addStretch()
-        columns.addLayout(left, 5)
+        scroll = QScrollArea()
+        scroll.setWidget(left_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(left_widget.sizeHint().width() + 20)
+        columns.addWidget(scroll, 5)
         columns.addWidget(self._build_log_group(), 6)
         root.addLayout(columns, 1)
 
@@ -353,30 +372,85 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.region_label)
         return box
 
+    def _build_timer_row(self) -> QHBoxLayout:
+        """Таймер: автоматически остановить мониторинг через N часов/минут или в заданное время."""
+        row = QHBoxLayout()
+        self.timer_check = QCheckBox("Таймер: остановить мониторинг")
+        self.timer_check.setToolTip(
+            "Мониторинг выключится сам — например, через 1:30 (длительность лекции)\n"
+            "или в 15:30. Отсчёт начинается при каждом нажатии «Старт».")
+        self.timer_check.toggled.connect(self._on_timer_changed)
+        self.timer_mode_combo = QComboBox()
+        self.timer_mode_combo.addItem("через", TIMER_AFTER)
+        self.timer_mode_combo.addItem("в", TIMER_AT)
+        self.timer_mode_combo.currentIndexChanged.connect(self._on_timer_mode_changed)
+        self.timer_edit = QTimeEdit(displayFormat="H:mm")
+        self.timer_edit.timeChanged.connect(self._on_timer_changed)
+        self.timer_hint = QLabel()
+        self.timer_left_label = QLabel()
+        self.timer_left_label.setStyleSheet("font-weight: 600;")
+        row.addWidget(self.timer_check)
+        row.addWidget(self.timer_mode_combo)
+        row.addWidget(self.timer_edit)
+        row.addWidget(self.timer_hint)
+        row.addStretch()
+        row.addWidget(self.timer_left_label)
+        return row
+
     def _build_save_group(self) -> QGroupBox:
-        box = QGroupBox("Сохранение")
+        box = QGroupBox("Куда сохранять")
         grid = QGridLayout(box)
 
+        # Папка с отдельными файлами
+        self.folder_check = QCheckBox("Файлы PNG/JPG в папку")
+        self.folder_check.toggled.connect(self._on_targets_changed)
         self.folder_edit = QLineEdit(readOnly=True)
-        choose_btn = QPushButton("Выбрать папку…")
-        choose_btn.clicked.connect(self.choose_folder)
-        open_btn = QPushButton("Открыть")
-        open_btn.setToolTip("Открыть папку со скриншотами в проводнике")
-        open_btn.clicked.connect(self.open_folder)
-        grid.addWidget(QLabel("Папка:"), 0, 0)
-        grid.addWidget(self.folder_edit, 0, 1, 1, 3)
+        self.choose_folder_btn = QPushButton("Выбрать папку…")
+        self.choose_folder_btn.clicked.connect(self.choose_folder)
+        self.open_folder_btn = QPushButton("Открыть")
+        self.open_folder_btn.setToolTip("Открыть папку со скриншотами в проводнике")
+        self.open_folder_btn.clicked.connect(self.open_folder)
+        grid.addWidget(self.folder_check, 0, 0, 1, 4)
+        grid.addWidget(QLabel("Папка:"), 1, 0)
+        grid.addWidget(self.folder_edit, 1, 1, 1, 3)
         folder_buttons = QHBoxLayout()
-        folder_buttons.addWidget(choose_btn)
-        folder_buttons.addWidget(open_btn)
+        folder_buttons.addWidget(self.choose_folder_btn)
+        folder_buttons.addWidget(self.open_folder_btn)
         folder_buttons.addStretch()
-        grid.addLayout(folder_buttons, 1, 1, 1, 3)
+        grid.addLayout(folder_buttons, 2, 1, 1, 3)
+
+        # Документ Word (конспект)
+        self.docx_check = QCheckBox("Документ Word — конспект, который заполняется сам")
+        self.docx_check.setToolTip(
+            "Каждый скриншот дописывается в конец документа .docx.\n"
+            "Если документ открыт в Microsoft Word, снимки появляются в нём сразу,\n"
+            "и рядом можно печатать свои заметки.")
+        self.docx_check.toggled.connect(self._on_targets_changed)
+        self.docx_edit = QLineEdit(readOnly=True)
+        self.choose_docx_btn = QPushButton("Выбрать документ…")
+        self.choose_docx_btn.setToolTip("Выберите существующий документ или введите имя нового")
+        self.choose_docx_btn.clicked.connect(self.choose_document)
+        self.open_docx_btn = QPushButton("Открыть в Word")
+        self.open_docx_btn.setToolTip("Открыть документ (если его ещё нет — он будет создан)")
+        self.open_docx_btn.clicked.connect(self.open_document)
+        self.captions_check = QCheckBox("Подписывать номер, дату и время")
+        self.captions_check.toggled.connect(lambda v: self._set("docx_captions", v))
+        grid.addWidget(self.docx_check, 3, 0, 1, 4)
+        grid.addWidget(QLabel("Документ:"), 4, 0)
+        grid.addWidget(self.docx_edit, 4, 1, 1, 3)
+        docx_buttons = QHBoxLayout()
+        docx_buttons.addWidget(self.choose_docx_btn)
+        docx_buttons.addWidget(self.open_docx_btn)
+        docx_buttons.addWidget(self.captions_check)
+        docx_buttons.addStretch()
+        grid.addLayout(docx_buttons, 5, 1, 1, 3)
 
         self.capture_combo = QComboBox()
         for mode, label in CAPTURE_LABELS:
             self.capture_combo.addItem(label, mode)
         self.capture_combo.currentIndexChanged.connect(self._on_capture_mode_changed)
-        grid.addWidget(QLabel("Сохранять:"), 2, 0)
-        grid.addWidget(self.capture_combo, 2, 1, 1, 3)
+        grid.addWidget(QLabel("Что снимать:"), 6, 0)
+        grid.addWidget(self.capture_combo, 6, 1, 1, 3)
 
         self.format_combo = QComboBox()
         self.format_combo.addItem("PNG (без потерь)", "png")
@@ -385,10 +459,10 @@ class MainWindow(QMainWindow):
         self.quality_spin = QSpinBox(minimum=10, maximum=100, suffix=" %")
         self.quality_spin.setToolTip("Качество JPG: больше — лучше картинка, но крупнее файл")
         self.quality_spin.valueChanged.connect(lambda v: self._set("jpeg_quality", v))
-        grid.addWidget(QLabel("Формат:"), 3, 0)
-        grid.addWidget(self.format_combo, 3, 1)
-        grid.addWidget(QLabel("Качество JPG:"), 3, 2)
-        grid.addWidget(self.quality_spin, 3, 3)
+        grid.addWidget(QLabel("Формат:"), 7, 0)
+        grid.addWidget(self.format_combo, 7, 1)
+        grid.addWidget(QLabel("Качество JPG:"), 7, 2)
+        grid.addWidget(self.quality_spin, 7, 3)
         grid.setColumnStretch(1, 1)
         return box
 
@@ -446,6 +520,20 @@ class MainWindow(QMainWindow):
         self.winrun_check.setVisible(autorun_supported())
         self.winrun_check.toggled.connect(self._on_winrun_toggled)
         lay.addWidget(self.winrun_check)
+
+        # Горячая клавиша паузы/старта
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Горячая клавиша паузы/старта:"))
+        self.hotkey_edit = QKeySequenceEdit()
+        self.hotkey_edit.setMaximumSequenceLength(1)
+        self.hotkey_edit.setToolTip("Щёлкните и нажмите новое сочетание, например Ctrl+Alt+S")
+        self.hotkey_edit.editingFinished.connect(self._on_hotkey_edited)
+        reset_hotkey_btn = QPushButton("По умолчанию")
+        reset_hotkey_btn.setToolTip(f"Вернуть {DEFAULT_HOTKEY}")
+        reset_hotkey_btn.clicked.connect(lambda: self._apply_hotkey(DEFAULT_HOTKEY))
+        row.addWidget(self.hotkey_edit, 1)
+        row.addWidget(reset_hotkey_btn)
+        lay.addLayout(row)
         return box
 
     def _build_log_group(self) -> QGroupBox:
@@ -496,7 +584,15 @@ class MainWindow(QMainWindow):
         s = self.settings
         self._loading = True
         try:
+            self.folder_check.setChecked(s.save_to_folder)
             self.folder_edit.setText(s.save_dir)
+            self.docx_check.setChecked(s.save_to_docx)
+            self.docx_edit.setText(s.docx_path)
+            self.captions_check.setChecked(s.docx_captions)
+            self.timer_check.setChecked(s.timer_enabled)
+            self.timer_mode_combo.setCurrentIndex(max(0, self.timer_mode_combo.findData(s.timer_mode)))
+            self._show_timer_value()
+            self.hotkey_edit.setKeySequence(QKeySequence(s.hotkey))
             self.capture_combo.setCurrentIndex(max(0, self.capture_combo.findData(s.capture_mode)))
             self.format_combo.setCurrentIndex(max(0, self.format_combo.findData(s.image_format)))
             self.quality_spin.setValue(s.jpeg_quality)
@@ -514,6 +610,7 @@ class MainWindow(QMainWindow):
         finally:
             self._loading = False
         self._update_region_label()
+        self._update_target_widgets()
 
     # ================================================================ Состояние
 
@@ -541,7 +638,10 @@ class MainWindow(QMainWindow):
             self.tray.setIcon(self._icons[running])
             self.tray_toggle_action.setText("Пауза" if running else "Старт")
             state = "мониторинг активен" if running else "мониторинг остановлен"
-            self.tray.setToolTip(f"{APP_NAME} — {state}\nСкриншотов: {self.shot_count}")
+            tip = f"{APP_NAME} — {state}\nСкриншотов: {self.shot_count}"
+            if running and self._deadline:
+                tip += f"\nОстановка по таймеру в {self._deadline:%H:%M}"
+            self.tray.setToolTip(tip)
 
     def _update_region_label(self) -> None:
         region = self.settings.region
@@ -621,19 +721,26 @@ class MainWindow(QMainWindow):
                 self._notify("Мониторинг не запущен", msg, QSystemTrayIcon.MessageIcon.Warning)
             return False
 
-        # Проверка 3: доступна ли папка для записи
-        error = check_folder_writable(s.save_dir)
-        if error:
-            self._log(error, "error")
-            if interactive:
-                answer = QMessageBox.warning(
-                    self, APP_NAME, f"{error}\n\nВыбрать другую папку?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if answer == QMessageBox.StandardButton.Yes and self.choose_folder():
-                    return self.start_monitoring(interactive)
-            else:
-                self._notify("Мониторинг не запущен", error, QSystemTrayIcon.MessageIcon.Critical)
-            return False
+        # Проверка 3: выбрано ли, куда сохранять, и доступно ли это для записи
+        if not (s.save_to_folder or s.save_to_docx):
+            return self._start_refused("Не выбрано, куда сохранять скриншоты: отметьте папку "
+                                       "и/или документ Word.", interactive)
+        if s.save_to_folder:
+            error = check_folder_writable(s.save_dir)
+            if error:
+                if interactive:
+                    self._log(error, "error")
+                    answer = QMessageBox.warning(
+                        self, APP_NAME, f"{error}\n\nВыбрать другую папку?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                    if answer == QMessageBox.StandardButton.Yes and self.choose_folder():
+                        return self.start_monitoring(interactive)
+                    return False
+                return self._start_refused(error, interactive)
+        if s.save_to_docx:
+            error = check_docx_target(s.docx_path)
+            if error:
+                return self._start_refused(error, interactive)
 
         monitor = ScreenMonitor(s, self)
         monitor.screenshot_saved.connect(self._on_screenshot_saved)
@@ -646,10 +753,27 @@ class MainWindow(QMainWindow):
         monitor.start()
 
         mode = dict(CAPTURE_LABELS)[s.capture_mode].lower()
+        targets = []
+        if s.save_to_folder:
+            targets.append(f"папка «{s.save_dir}»")
+        if s.save_to_docx:
+            targets.append(f"документ «{Path(s.docx_path).name}»")
         self._log(f"Мониторинг запущен: интервал {s.interval_sec:g} с, порог {s.threshold_percent:g} %, "
-                  f"сохранять: {mode}, формат {s.image_format.upper()}", "success")
+                  f"снимать: {mode}, формат {s.image_format.upper()}, куда: {', '.join(targets)}",
+                  "success")
+        self._monitor_started = datetime.now()
+        self._arm_timer(announce=True)
         self._update_state()
         return True
+
+    def _start_refused(self, message: str, interactive: bool) -> bool:
+        """Сообщает, почему мониторинг не запущен (диалог или уведомление в трее)."""
+        self._log(message, "error")
+        if interactive:
+            QMessageBox.warning(self, APP_NAME, message)
+        else:
+            self._notify("Мониторинг не запущен", message, QSystemTrayIcon.MessageIcon.Critical)
+        return False
 
     def stop_monitoring(self, message: str | None = "Мониторинг остановлен") -> None:
         if not self.monitor:
@@ -658,6 +782,8 @@ class MainWindow(QMainWindow):
         monitor.stop()  # поток завершится сам в течение интервала проверки
         if message:
             self._log(message)
+        self._monitor_started = None
+        self._arm_timer()
         self.check_label.setText("Мониторинг остановлен")
         self._update_state()
 
@@ -669,14 +795,14 @@ class MainWindow(QMainWindow):
             self._update_state()
         thread.deleteLater()
 
-    def _on_screenshot_saved(self, path: str, percent: float) -> None:
+    def _on_screenshot_saved(self, description: str, percent: float, target: str) -> None:
         self.shot_count += 1
-        self.last_file = path
-        name = Path(path).name
-        self._log(f"Скриншот сохранён: {name} (изменилось {percent:.2f} % области)", "success")
+        self.last_target = target
+        self._log(f"Скриншот сохранён: {description} (изменилось {percent:.2f} % области)", "success")
         self._update_state()
         if self.settings.notifications_enabled:
-            self._notify("Скриншот сохранён", f"{name}\nНажмите, чтобы открыть папку")
+            what = "документ" if target.lower().endswith(".docx") else "папку"
+            self._notify("Скриншот сохранён", f"{description}\nНажмите, чтобы открыть {what}")
 
     def _on_frame_checked(self, percent: float) -> None:
         self.check_label.setText(f"Проверка {datetime.now():%H:%M:%S}: изменилось {percent:.2f} % "
@@ -762,6 +888,122 @@ class MainWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
+    def choose_document(self) -> bool:
+        """Выбор документа Word: существующего (скриншоты допишутся в конец) или нового."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Документ Word для скриншотов", self.settings.docx_path,
+            "Документ Word (*.docx)", options=QFileDialog.Option.DontConfirmOverwrite)
+        if not path:
+            return False
+        path = os.path.normpath(path)
+        if not path.lower().endswith(".docx"):
+            path += ".docx"
+        error = check_docx_target(path)
+        if error:
+            self._log(error, "error")
+            QMessageBox.warning(self, APP_NAME, error)
+            return False
+        self.settings.docx_path = path
+        self.docx_edit.setText(path)
+        if not self.docx_check.isChecked():
+            self.docx_check.setChecked(True)  # выбрали документ — значит, хотят в него сохранять
+        self._settings_changed()
+        exists = "существующий, скриншоты будут дописаны в конец" if os.path.exists(path) else "новый"
+        self._log(f"Документ для скриншотов: {path} ({exists})")
+        return True
+
+    def open_document(self) -> None:
+        """Открывает документ в Word (создаёт пустой, если его ещё нет)."""
+        path = self.settings.docx_path
+        error = check_docx_target(path)
+        if error:
+            self._log(error, "error")
+            QMessageBox.warning(self, APP_NAME, error)
+            return
+        try:
+            ensure_document(path)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Не удалось создать документ «{path}»: {exc}", "error")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _on_targets_changed(self) -> None:
+        self._update_target_widgets()
+        if self._loading:
+            return
+        self.settings.save_to_folder = self.folder_check.isChecked()
+        self.settings.save_to_docx = self.docx_check.isChecked()
+        self._settings_changed()
+
+    def _update_target_widgets(self) -> None:
+        folder, docx = self.folder_check.isChecked(), self.docx_check.isChecked()
+        for widget in (self.folder_edit, self.choose_folder_btn, self.open_folder_btn):
+            widget.setEnabled(folder)
+        for widget in (self.docx_edit, self.choose_docx_btn, self.open_docx_btn, self.captions_check):
+            widget.setEnabled(docx)
+
+    # ================================================================ Таймер
+
+    def _show_timer_value(self) -> None:
+        """Показывает в поле значение для текущего режима таймера."""
+        s = self.settings
+        if self.timer_mode_combo.currentData() == TIMER_AT:
+            hours, minutes = parse_hhmm(s.timer_at) or (18, 0)
+            self.timer_hint.setText("(время суток)")
+        else:
+            hours, minutes = divmod(s.timer_minutes, 60)
+            self.timer_hint.setText("(часы:минуты)")
+        self.timer_edit.setTime(QTime(hours, minutes))
+
+    def _on_timer_mode_changed(self, _index: int) -> None:
+        was_loading, self._loading = self._loading, True
+        try:
+            self._show_timer_value()
+        finally:
+            self._loading = was_loading
+        self._on_timer_changed()
+
+    def _on_timer_changed(self, *_args) -> None:
+        if self._loading:
+            return
+        s = self.settings
+        s.timer_enabled = self.timer_check.isChecked()
+        s.timer_mode = self.timer_mode_combo.currentData()
+        value = self.timer_edit.time()
+        if s.timer_mode == TIMER_AT:
+            s.timer_at = f"{value.hour():02d}:{value.minute():02d}"
+        else:
+            s.timer_minutes = max(1, value.hour() * 60 + value.minute())
+        self._settings_changed()
+        self._arm_timer()
+
+    def _arm_timer(self, announce: bool = False) -> None:
+        """Пересчитывает момент остановки (при старте и при изменении настроек таймера)."""
+        s = self.settings
+        if self.monitor is None or not s.timer_enabled or self._monitor_started is None:
+            self._deadline = None
+            self._countdown.stop()
+            self.timer_left_label.clear()
+            return
+        base = datetime.now() if s.timer_mode == TIMER_AT else self._monitor_started
+        self._deadline = timer_deadline(base, s.timer_mode, s.timer_minutes, s.timer_at)
+        if announce:
+            left = format_duration(self._deadline - datetime.now())
+            self._log(f"Таймер: мониторинг остановится в {self._deadline:%H:%M} (через {left})")
+        self._countdown.start()
+        self._on_countdown()
+
+    def _on_countdown(self) -> None:
+        if self._deadline is None:
+            return
+        left = self._deadline - datetime.now()
+        if left.total_seconds() <= 0:
+            count = self.shot_count
+            self.stop_monitoring("Таймер: мониторинг остановлен автоматически")
+            self._notify(APP_NAME, f"Мониторинг остановлен по таймеру. Скриншотов: {count}")
+            return
+        self.timer_left_label.setText(f"⏱ Осталось {format_duration(left)} (до {self._deadline:%H:%M})")
+
     # ================================================================ Настройки
 
     def _set(self, name: str, value) -> None:
@@ -810,16 +1052,43 @@ class MainWindow(QMainWindow):
     def _setup_hotkey(self) -> None:
         self.hotkey = GlobalHotkey(self)
         self.hotkey.activated.connect(self._on_hotkey)
-        combo = self.settings.hotkey
+        self._register_hotkey(self.settings.hotkey)
+
+    def _register_hotkey(self, combo: str) -> bool:
+        """Регистрирует сочетание. Если глобально не вышло — работает только в окне программы."""
+        if self._local_shortcut is not None:
+            self._local_shortcut.setEnabled(False)
+            self._local_shortcut.deleteLater()
+            self._local_shortcut = None
         if self.hotkey.register(combo):
             self.hotkey_label.setText(f"Горячая клавиша {combo} — пауза/старт")
             self._log(f"Горячая клавиша {combo}: пауза/старт мониторинга")
-        else:
-            # Запасной вариант: сочетание работает, только когда окно активно
-            QShortcut(QKeySequence(combo), self).activated.connect(self._on_hotkey)
-            self.hotkey_label.setText(f"{combo} — пауза/старт (только в окне программы)")
-            self._log(f"Глобальная горячая клавиша {combo} недоступна ({self.hotkey.error}). "
-                      "Она будет работать только в окне программы.", "warning")
+            return True
+        # Запасной вариант: сочетание работает, только когда окно активно
+        self._local_shortcut = QShortcut(QKeySequence(combo), self)
+        self._local_shortcut.activated.connect(self._on_hotkey)
+        self.hotkey_label.setText(f"{combo} — пауза/старт (только в окне программы)")
+        self._log(f"Глобальная горячая клавиша {combo} недоступна ({self.hotkey.error}). "
+                  "Она будет работать только в окне программы.", "warning")
+        return False
+
+    def _on_hotkey_edited(self) -> None:
+        combo = self.hotkey_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
+        if combo and combo != self.settings.hotkey:
+            self._apply_hotkey(combo)
+
+    def _apply_hotkey(self, combo: str) -> None:
+        """Меняет горячую клавишу из интерфейса."""
+        if parse_hotkey(combo) is None:
+            self._log(f"Сочетание «{combo}» не подходит: нужна буква, цифра или F1–F24 "
+                      "вместе с Ctrl, Alt, Shift или Win", "warning")
+            self.hotkey_edit.setKeySequence(QKeySequence(self.settings.hotkey))
+            return
+        self.hotkey_edit.setKeySequence(QKeySequence(combo))
+        if combo == self.settings.hotkey and self._local_shortcut is None:
+            return
+        self._set("hotkey", combo)
+        self._register_hotkey(combo)
 
     def _on_hotkey(self) -> None:
         now = time.monotonic()
@@ -848,7 +1117,9 @@ class MainWindow(QMainWindow):
                 self.show_window()
 
     def _on_tray_message_clicked(self) -> None:
-        if self.last_file:
+        if self.last_target.lower().endswith(".docx"):
+            self.open_document()
+        elif self.last_target:
             self.open_folder()
         else:
             self.show_window()

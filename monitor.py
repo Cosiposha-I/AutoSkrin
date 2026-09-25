@@ -5,8 +5,10 @@ monitor.py — логика отслеживания изменений в вы�
     compute_change_percent() — сравнение двух кадров (numpy);
     ChangeDetector           — решает, когда делать снимок (порог + антиспам);
     save_image()             — сохранение PNG/JPG с временной меткой в имени;
+    timer_deadline()         — когда остановить мониторинг по таймеру;
     ScreenMonitor            — поток QThread, который периодически
-                               захватывает область и сохраняет скриншоты.
+                               захватывает область и сохраняет скриншоты
+                               в папку и/или документ Word (см. word_doc.py).
 
 Работа с экраном идёт через mss в физических пикселях.
 """
@@ -18,7 +20,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import mss
@@ -26,7 +28,9 @@ import numpy as np
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from settings import CAPTURE_ALL, CAPTURE_REGION, CAPTURE_SCREEN, Region, Settings
+from settings import (CAPTURE_ALL, CAPTURE_REGION, CAPTURE_SCREEN, TIMER_AT, Region, Settings,
+                      parse_hhmm)
+from word_doc import ADDED_TO_WORD, PENDING, WordDocumentWriter
 
 log = logging.getLogger(__name__)
 
@@ -198,6 +202,30 @@ def find_monitor(monitors: list[dict], region: Region) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Таймер автоматической остановки
+# ---------------------------------------------------------------------------
+
+def timer_deadline(started: datetime, mode: str, minutes: int, at: str) -> datetime:
+    """
+    Момент автоматической остановки мониторинга.
+    «через»: started + minutes; «в»: ближайшее наступление времени at (ЧЧ:ММ).
+    """
+    if mode == TIMER_AT:
+        hours, mins = parse_hhmm(at) or (18, 0)
+        deadline = started.replace(hour=hours, minute=mins, second=0, microsecond=0)
+        if deadline <= started:
+            deadline += timedelta(days=1)  # это время сегодня уже прошло — значит, завтра
+        return deadline
+    return started + timedelta(minutes=minutes)
+
+
+def format_duration(delta: timedelta) -> str:
+    """timedelta → «1:29:58»."""
+    total = max(0, int(delta.total_seconds()))
+    return f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+# ---------------------------------------------------------------------------
 # Поток мониторинга
 # ---------------------------------------------------------------------------
 
@@ -208,7 +236,7 @@ class ScreenMonitor(QThread):
     поэтому GUI никогда не «подвисает».
     """
 
-    screenshot_saved = pyqtSignal(str, float)   # путь к файлу, % изменённых пикселей
+    screenshot_saved = pyqtSignal(str, float, str)  # описание, % изменений, что открыть по щелчку
     frame_checked = pyqtSignal(float)            # % изменений на последней проверке
     log_message = pyqtSignal(str, str)           # текст, уровень: info / warning / error
     fatal_error = pyqtSignal(str)                # мониторинг остановлен из-за ошибки
@@ -220,6 +248,8 @@ class ScreenMonitor(QThread):
         self._settings = settings.copy()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._writer: WordDocumentWriter | None = None  # создаётся в потоке мониторинга
+        self._busy_warned = False
 
     # --- управление из GUI-потока ---
 
@@ -246,6 +276,8 @@ class ScreenMonitor(QThread):
         except Exception as exc:  # noqa: BLE001 — любая ошибка должна дойти до GUI
             log.exception("Сбой потока мониторинга")
             self.fatal_error.emit(f"Сбой мониторинга: {exc}")
+        finally:
+            self._close_writer()
 
     def _loop(self, sct) -> None:
         cfg = self._current_settings()
@@ -292,36 +324,117 @@ class ScreenMonitor(QThread):
             # 3. Сохранение скриншота
             if decision.take_screenshot and not self._stop_event.is_set():
                 try:
-                    path = self._save(sct, cfg, region, shot)
-                except OSError as exc:
-                    self.fatal_error.emit(
-                        f"Не удалось сохранить скриншот в «{cfg.save_dir}»: {exc.strerror or exc}")
+                    saved = self._save(sct, cfg, region, shot)
+                except _FatalSaveError as exc:
+                    self.fatal_error.emit(str(exc))
                     return
                 except Exception as exc:  # noqa: BLE001 — например, ошибка захвата всего экрана
                     self.log_message.emit(f"Не удалось сделать скриншот: {exc}", "error")
                 else:
                     detector.mark_saved(time.monotonic())
-                    self.screenshot_saved.emit(str(path), decision.trigger_percent)
+                    self.screenshot_saved.emit(saved[0], decision.trigger_percent, saved[1])
 
             self._sleep(cfg.interval_sec, started)
 
-    def _save(self, sct, cfg: Settings, region: Region, region_shot) -> Path:
-        """Делает и сохраняет скриншот согласно режиму (область / экран / все мониторы)."""
+    def _save(self, sct, cfg: Settings, region: Region, region_shot) -> tuple[str, str]:
+        """
+        Делает скриншот согласно режиму (область / экран / все мониторы) и
+        сохраняет его в папку и/или документ Word.
+        Возвращает (описание для журнала, путь для открытия по щелчку).
+        """
         if cfg.capture_mode == CAPTURE_SCREEN:
             shot = sct.grab(find_monitor(sct.monitors, region))
         elif cfg.capture_mode == CAPTURE_ALL:
             shot = sct.grab(sct.monitors[0])
         else:
             shot = region_shot  # CAPTURE_REGION — сохраняем тот самый кадр, где нашли изменение
-        return save_image(shot_to_image(shot), cfg.save_dir, cfg.image_format, cfg.jpeg_quality)
+        image = shot_to_image(shot)
+        when = datetime.now()
+        parts: list[str] = []
+        target = ""
+
+        file_path = None
+        if cfg.save_to_folder:
+            try:
+                file_path = save_image(image, cfg.save_dir, cfg.image_format, cfg.jpeg_quality, when)
+            except OSError as exc:
+                raise _FatalSaveError(
+                    f"Не удалось сохранить скриншот в «{cfg.save_dir}»: {exc.strerror or exc}") from exc
+            parts.append(file_path.name)
+            target = str(file_path)
+
+        if cfg.save_to_docx:
+            doc_part = self._add_to_document(cfg, image, when, file_path)
+            if doc_part:
+                parts.append(doc_part)
+                target = target or cfg.docx_path
+        return " + ".join(parts) or "—", target
+
+    # --- документ Word ---
+
+    def _writer_for(self, cfg: Settings) -> WordDocumentWriter:
+        """Объект записи в документ; пересоздаётся при смене документа."""
+        if self._writer is not None and os.path.normcase(str(self._writer.path)) != \
+                os.path.normcase(os.path.abspath(cfg.docx_path)):
+            self._close_writer()
+        if self._writer is None:
+            self._writer = WordDocumentWriter(os.path.abspath(cfg.docx_path))
+            self._busy_warned = False
+        self._writer.captions = cfg.docx_captions
+        self._writer.image_format = cfg.image_format
+        self._writer.jpeg_quality = cfg.jpeg_quality
+        return self._writer
+
+    def _add_to_document(self, cfg: Settings, image, when: datetime, file_path: Path | None) -> str:
+        writer = self._writer_for(cfg)
+        name = writer.path.name
+        try:
+            status = writer.add(image, when, file_path)
+        except Exception as exc:  # noqa: BLE001 — повреждённый документ, нет места на диске и т.п.
+            log.exception("Ошибка записи в документ")
+            message = f"Не удалось добавить скриншот в документ «{name}»: {exc}"
+            if not cfg.save_to_folder:
+                raise _FatalSaveError(message) from exc
+            self.log_message.emit(message, "error")
+            return ""
+        if status == PENDING:
+            if not self._busy_warned:
+                self._busy_warned = True
+                self.log_message.emit(
+                    f"Документ «{name}» занят другой программой — скриншоты будут добавлены, "
+                    "как только его закроют (или откройте его в Microsoft Word)", "warning")
+            return f"{name} (в очереди: {len(writer.pending)})"
+        if self._busy_warned:
+            self._busy_warned = False
+            self.log_message.emit(f"Отложенные скриншоты добавлены в «{name}»", "info")
+        return f"{name} (открыт в Word)" if status == ADDED_TO_WORD else name
+
+    def _close_writer(self) -> None:
+        if self._writer is None:
+            return
+        writer, self._writer = self._writer, None
+        try:
+            left, rescue_dir = writer.close()
+        except Exception as exc:  # noqa: BLE001
+            self.log_message.emit(f"Ошибка при закрытии документа: {exc}", "error")
+            return
+        if left:
+            where = f" Их файлы перенесены в «{rescue_dir}»." if rescue_dir else " Они есть в папке со скриншотами."
+            self.log_message.emit(
+                f"{left} скриншот(ов) не удалось добавить в «{writer.path.name}»: документ занят.{where}",
+                "warning")
 
     def _sleep(self, interval: float, started: float) -> None:
         """Ждёт до следующей проверки, но сразу просыпается при stop()."""
         self._stop_event.wait(max(0.0, interval - (time.monotonic() - started)))
 
 
+class _FatalSaveError(Exception):
+    """Сохранить снимок некуда — мониторинг нужно остановить."""
+
+
 __all__ = [
     "CAPTURE_ALL", "CAPTURE_REGION", "CAPTURE_SCREEN", "ChangeDetector", "Decision",
-    "ScreenMonitor", "compute_change_percent", "create_mss", "find_monitor",
-    "make_screenshot_path", "save_image", "shot_to_array", "shot_to_image",
+    "ScreenMonitor", "compute_change_percent", "create_mss", "find_monitor", "format_duration",
+    "make_screenshot_path", "save_image", "shot_to_array", "shot_to_image", "timer_deadline",
 ]

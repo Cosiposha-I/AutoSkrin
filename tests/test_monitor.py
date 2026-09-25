@@ -1,13 +1,13 @@
 """Тесты логики сравнения кадров, антиспам-защиты и сохранения файлов."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pytest
 from PIL import Image
 
-from monitor import (ChangeDetector, compute_change_percent, find_monitor, make_screenshot_path,
-                     save_image)
+from monitor import (ChangeDetector, compute_change_percent, find_monitor, format_duration,
+                     make_screenshot_path, save_image, timer_deadline)
 from settings import Region
 
 
@@ -138,3 +138,20 @@ def test_find_monitor():
     assert find_monitor(monitors, Region(2000, 100, 100, 100)) is monitors[2]
     assert find_monitor(monitors, Region(1800, 100, 400, 100)) is monitors[2]  # большая часть справа
     assert find_monitor(monitors, Region(-500, -500, 10, 10)) is monitors[0]   # вне экранов
+
+
+def test_timer_after_duration():
+    start = datetime(2024, 1, 15, 14, 0, 0)
+    assert timer_deadline(start, "after", 90, "00:00") == datetime(2024, 1, 15, 15, 30)
+
+
+def test_timer_at_time_of_day():
+    now = datetime(2024, 1, 15, 14, 0, 0)
+    assert timer_deadline(now, "at", 0, "15:30") == datetime(2024, 1, 15, 15, 30)
+    # Время сегодня уже прошло — остановка завтра
+    assert timer_deadline(now, "at", 0, "09:00") == datetime(2024, 1, 16, 9, 0)
+
+
+def test_format_duration():
+    assert format_duration(timedelta(hours=1, minutes=29, seconds=58)) == "1:29:58"
+    assert format_duration(timedelta(seconds=-5)) == "0:00:00"

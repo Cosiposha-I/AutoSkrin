@@ -174,9 +174,39 @@ def run_self_test(report_path: str) -> int:
             win.quit_app()
             return f"трей: {'есть' if win.tray_available else 'нет'}, горячая клавиша: {hotkey}"
 
+    def word_document():
+        from datetime import datetime
+
+        from docx import Document
+        from PIL import Image
+
+        from word_doc import WordDocumentWriter
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "Конспект.docx"
+            writer = WordDocumentWriter(str(path))
+            com = "доступна" if writer._com else "нет"
+            for color in ("red", "blue"):
+                writer.add(Image.new("RGB", (320, 200), color), datetime.now())
+            left, _ = writer.close()
+            pictures = len(Document(str(path)).inline_shapes)
+            if pictures != 2 or left:
+                raise RuntimeError(f"в документе {pictures} снимков, не добавлено {left}")
+            return f"2 снимка добавлены, автоматизация Word (COM): {com}"
+
+    def user_settings():
+        from settings import load_settings
+        s = load_settings()
+        return (f"папка={s.save_to_folder}:{s.save_dir}, word={s.save_to_docx}:{s.docx_path}, "
+                f"снимать={s.capture_mode}, формат={s.image_format}, интервал={s.interval_sec:g}, "
+                f"порог={s.threshold_percent:g}, антиспам={s.min_interval_sec:g}, "
+                f"уведомления={s.notifications_enabled}, автостарт={s.autostart_monitoring}, "
+                f"трей={s.minimize_to_tray}, область={s.region}, клавиша={s.hotkey}")
+
     check("захват экрана и сохранение файлов", grab)
     check("главное окно", window)
-    check("разбор горячей клавиши", lambda: str(parse_hotkey("Ctrl+Shift+S")))
+    check("документ Word", word_document)
+    check("разбор горячей клавиши", lambda: str(parse_hotkey("Ctrl+Alt+S")))
+    check("настройки пользователя", user_settings)
 
     Path(report_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0 if ok else 1

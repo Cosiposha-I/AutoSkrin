@@ -1,5 +1,6 @@
 # Сборка AutoSkrin для Windows: тесты → exe (PyInstaller) → самопроверка →
-# установщик (Inno Setup) + переносной ZIP → публикация в GitHub Releases.
+# установщик (Inno Setup) + переносной ZIP → проверка установщика →
+# публикация в GitHub Releases.
 name: Сборка установщика для Windows
 
 on:
@@ -48,6 +49,9 @@ jobs:
       - name: Сборка exe, самопроверка, установщик и ZIP
         id: build
         run: python tools/build.py --require-installer
+
+      - name: Проверка установщика (тихая установка с параметрами и удаление)
+        run: python tools/test_installer.py
 
       - name: Сохранить файлы сборки
         uses: actions/upload-artifact@v4

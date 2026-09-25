@@ -7,7 +7,8 @@ from settings import Region, Settings
 
 def test_parse_hotkey():
     from ui import parse_hotkey
-    assert parse_hotkey("Ctrl+Shift+S") == (["ctrl", "shift"], "S")
+    assert parse_hotkey("Ctrl+Alt+S") == (["ctrl", "alt"], "S")
+    assert parse_hotkey("Meta+Shift+1") == (["win", "shift"], "1")
     assert parse_hotkey("ctrl + alt + f5") == (["ctrl", "alt"], "F5")
     assert parse_hotkey("S") is None
     assert parse_hotkey("Ctrl+Щ") is None
@@ -63,3 +64,52 @@ def test_settings_changes_are_saved(window, isolated_config):
     assert saved.threshold_percent == 3.5
     assert saved.image_format == "jpg"
     assert window.quality_spin.isEnabled()
+
+
+def test_start_refused_without_targets(window):
+    window.settings.region = Region(0, 0, 50, 50)
+    window.folder_check.setChecked(False)
+    assert window.start_monitoring(interactive=False) is False
+    assert "Не выбрано, куда сохранять" in window.log_view.toPlainText()
+
+
+def test_start_refused_with_bad_document(window, tmp_path):
+    window.settings.region = Region(0, 0, 50, 50)
+    window.settings.docx_path = str(tmp_path / "notes.txt")
+    window.docx_check.setChecked(True)
+    assert window.start_monitoring(interactive=False) is False
+    assert "расширение .docx" in window.log_view.toPlainText()
+
+
+def test_timer_arms_and_stops_monitoring(window):
+    from datetime import datetime, timedelta
+    window.settings.region = Region(0, 0, 50, 50)
+    window.timer_check.setChecked(True)
+    window.timer_edit.setTime(window.timer_edit.time().fromString("1:30", "H:mm"))
+    assert window.settings.timer_minutes == 90
+    assert window.start_monitoring(interactive=False)
+    assert window._deadline is not None
+    assert timedelta(minutes=89) < window._deadline - datetime.now() <= timedelta(minutes=90)
+    assert "Осталось 1:" in window.timer_left_label.text()
+    window._deadline = datetime.now() - timedelta(seconds=1)   # время вышло
+    window._on_countdown()
+    assert window.monitor is None
+    assert "остановлен автоматически" in window.log_view.toPlainText()
+    assert window.timer_left_label.text() == ""
+
+
+def test_timer_mode_at(window):
+    from settings import TIMER_AT
+    window.timer_mode_combo.setCurrentIndex(window.timer_mode_combo.findData(TIMER_AT))
+    window.timer_edit.setTime(window.timer_edit.time().fromString("15:30", "H:mm"))
+    assert window.settings.timer_mode == TIMER_AT
+    assert window.settings.timer_at == "15:30"
+    assert window.timer_hint.text() == "(время суток)"
+
+
+def test_hotkey_can_be_changed(window):
+    window._apply_hotkey("Ctrl+Alt+F9")
+    assert window.settings.hotkey == "Ctrl+Alt+F9"
+    window._apply_hotkey("Ctrl+Щ")                 # неподходящее сочетание не принимается
+    assert window.settings.hotkey == "Ctrl+Alt+F9"
+    assert "не подходит" in window.log_view.toPlainText()

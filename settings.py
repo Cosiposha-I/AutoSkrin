@@ -14,15 +14,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
+import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 # Общие сведения о приложении (используются в UI, сборке и установщике)
 APP_NAME = "AutoSkrin"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # Режимы сохранения скриншота
 CAPTURE_REGION = "region"   # только выбранная область
@@ -32,6 +34,20 @@ CAPTURE_MODES = (CAPTURE_REGION, CAPTURE_SCREEN, CAPTURE_ALL)
 
 # Поддерживаемые форматы файлов
 IMAGE_FORMATS = ("png", "jpg")
+
+# Режимы таймера автоматической остановки
+TIMER_AFTER = "after"   # остановить через заданное время (например, 1:30)
+TIMER_AT = "at"         # остановить в заданное время суток (например, 15:30)
+TIMER_MODES = (TIMER_AFTER, TIMER_AT)
+
+# Горячая клавиша паузы/старта. Раньше по умолчанию было Ctrl+Shift+S,
+# но это сочетание занято «Сохранить как» и «Ножницами» Windows.
+DEFAULT_HOTKEY = "Ctrl+Alt+S"
+_OLD_DEFAULT_HOTKEY = "Ctrl+Shift+S"
+
+# Файл с настройками, выбранными в установщике (лежит рядом с AutoSkrin.exe)
+INSTALLER_DEFAULTS_FILE = "defaults.json"
+_INSTALLER_META_KEYS = ("install_id", "apply_to_existing", "region", "applied_defaults_id")
 
 # Имя параметра автозапуска в реестре Windows
 _AUTORUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -65,6 +81,27 @@ def default_save_dir() -> str:
     """Папка для скриншотов по умолчанию: «Изображения/AutoSkrin»."""
     pictures = Path.home() / "Pictures"
     return str((pictures if pictures.is_dir() else Path.home()) / APP_NAME)
+
+
+def default_docx_path() -> str:
+    """Документ Word по умолчанию: «Изображения/AutoSkrin/Конспект.docx»."""
+    return str(Path(default_save_dir()) / "Конспект.docx")
+
+
+def get_app_dir() -> Path:
+    """Папка программы: рядом с AutoSkrin.exe (сборка) или с исходниками."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def parse_hhmm(text: str) -> tuple[int, int] | None:
+    """«15:30» → (15, 30); None, если время записано неверно."""
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", str(text))
+    if not match:
+        return None
+    hours, minutes = int(match.group(1)), int(match.group(2))
+    return (hours, minutes) if hours < 24 and minutes < 60 else None
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +158,26 @@ class Settings:
     capture_mode: str = CAPTURE_REGION
     image_format: str = "png"
     jpeg_quality: int = 90
+
+    # Куда сохранять: файлы в папку и/или документ Word (конспект)
+    save_to_folder: bool = True
+    save_to_docx: bool = False
+    docx_path: str = field(default_factory=default_docx_path)
+    docx_captions: bool = True          # подпись «Скриншот N — дата, время» над снимком
+
+    # Таймер автоматической остановки мониторинга
+    timer_enabled: bool = False
+    timer_mode: str = TIMER_AFTER
+    timer_minutes: int = 90             # «через»: 1 ч 30 мин
+    timer_at: str = "18:00"             # «в»: время суток
+
     notifications_enabled: bool = True
     autostart_monitoring: bool = False
     minimize_to_tray: bool = True
-    hotkey: str = "Ctrl+Shift+S"
+    hotkey: str = DEFAULT_HOTKEY
+
+    # Служебное: какие настройки установщика уже применены (см. load_settings)
+    applied_defaults_id: str = ""
 
     # Допустимые диапазоны числовых параметров: (минимум, максимум)
     LIMITS = {
@@ -133,6 +186,7 @@ class Settings:
         "pixel_tolerance": (0, 255),
         "min_interval_sec": (0.0, 3600.0),
         "jpeg_quality": (10, 100),
+        "timer_minutes": (1, 23 * 60 + 59),
     }
 
     def to_dict(self) -> dict[str, Any]:
@@ -161,9 +215,21 @@ class Settings:
             s.image_format = fmt
         if isinstance(data.get("hotkey"), str) and data["hotkey"].strip():
             s.hotkey = data["hotkey"].strip()
+            if s.hotkey.replace(" ", "").lower() == _OLD_DEFAULT_HOTKEY.lower():
+                s.hotkey = DEFAULT_HOTKEY  # старое значение по умолчанию — переводим на новое
+        if isinstance(data.get("docx_path"), str) and data["docx_path"].strip():
+            s.docx_path = data["docx_path"]
+        if data.get("timer_mode") in TIMER_MODES:
+            s.timer_mode = data["timer_mode"]
+        if parse_hhmm(data.get("timer_at", "")):
+            hours, minutes = parse_hhmm(data["timer_at"])
+            s.timer_at = f"{hours:02d}:{minutes:02d}"
+        if isinstance(data.get("applied_defaults_id"), str):
+            s.applied_defaults_id = data["applied_defaults_id"]
 
         # Логические флаги
-        for key in ("notifications_enabled", "autostart_monitoring", "minimize_to_tray"):
+        for key in ("notifications_enabled", "autostart_monitoring", "minimize_to_tray",
+                    "save_to_folder", "save_to_docx", "docx_captions", "timer_enabled"):
             if isinstance(data.get(key), bool):
                 setattr(s, key, data[key])
 
@@ -188,26 +254,79 @@ class Settings:
 # Загрузка и сохранение
 # ---------------------------------------------------------------------------
 
-def load_settings(path: Path | None = None) -> Settings:
+def _read_json(path: Path) -> Any:
+    # utf-8-sig: файл, записанный установщиком или «Блокнотом», может начинаться с BOM
+    with open(path, encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def load_installer_defaults(path: Path | None = None) -> dict[str, Any] | None:
     """
-    Загружает настройки из JSON. Если файла нет — возвращает значения
-    по умолчанию. Повреждённый файл переименовывается в *.bak,
-    чтобы пользователь не потерял его содержимое.
+    Настройки, выбранные в мастере установки (файл defaults.json рядом с exe).
+    Кроме самих настроек в нём есть:
+        install_id        — уникальная метка установки;
+        apply_to_existing — применить и к уже настроенной программе
+                            (пользователь снял «Оставить текущие настройки»).
+    """
+    path = path or get_app_dir() / INSTALLER_DEFAULTS_FILE
+    if not path.exists():
+        return None
+    try:
+        data = _read_json(path)
+    except (OSError, ValueError) as exc:
+        log.warning("Не удалось прочитать настройки установщика %s: %s", path, exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _without_meta(data: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in data.items() if k not in _INSTALLER_META_KEYS}
+
+
+def load_settings(path: Path | None = None, defaults_path: Path | None = None) -> Settings:
+    """
+    Загружает настройки пользователя из JSON.
+
+    * Файла ещё нет (первый запуск) — берутся настройки из установщика,
+      а если их нет — значения по умолчанию.
+    * Файл есть, а в установщике выбрано «заменить настройки» — настройки
+      установщика применяются один раз (выбранная область сохраняется).
+    * Повреждённый файл переименовывается в *.bak, чтобы не потерять его.
     """
     path = path or get_config_path()
-    if not path.exists():
-        return Settings()
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError) as exc:
-        log.warning("Не удалось прочитать настройки %s: %s", path, exc)
+    defaults = load_installer_defaults(defaults_path)
+
+    user_data = None
+    if path.exists():
         try:
-            os.replace(path, path.with_suffix(".json.bak"))
-        except OSError:
-            pass
-        return Settings()
-    return Settings.from_dict(data)
+            user_data = _read_json(path)
+        except (OSError, ValueError) as exc:
+            log.warning("Не удалось прочитать настройки %s: %s", path, exc)
+            try:
+                os.replace(path, path.with_suffix(".json.bak"))
+            except OSError:
+                pass
+
+    if not isinstance(user_data, dict):
+        settings = Settings.from_dict(_without_meta(defaults) if defaults else {})
+        if defaults:
+            settings.applied_defaults_id = str(defaults.get("install_id", ""))
+            log.info("Применены настройки из установщика")
+        return settings
+
+    settings = Settings.from_dict(user_data)
+    install_id = str(defaults.get("install_id", "")) if defaults else ""
+    if defaults and defaults.get("apply_to_existing") is True and install_id \
+            and install_id != settings.applied_defaults_id:
+        merged = {**user_data, **_without_meta(defaults)}
+        settings = Settings.from_dict(merged)
+        settings.applied_defaults_id = install_id
+        log.info("Настройки заменены выбранными в установщике")
+        try:
+            save_settings(settings, path)
+        except OSError as exc:
+            log.warning("Не удалось сохранить настройки: %s", exc)
+    return settings
 
 
 def save_settings(settings: Settings, path: Path | None = None) -> None:
@@ -245,6 +364,23 @@ def check_folder_writable(folder: str) -> str | None:
         os.remove(probe)
     except OSError as exc:
         return f"Нет доступа к папке «{folder}»: {exc.strerror or exc}"
+    return None
+
+
+def check_docx_target(path: str) -> str | None:
+    """
+    Проверяет, что в документ Word можно будет добавлять скриншоты.
+    Возвращает текст ошибки или None, если всё в порядке.
+    """
+    if not path or not path.strip():
+        return "Не выбран документ Word для скриншотов."
+    if not path.lower().endswith(".docx"):
+        return f"Документ «{path}» должен иметь расширение .docx."
+    error = check_folder_writable(str(Path(path).parent))
+    if error:
+        return error
+    if os.path.exists(path) and not zipfile.is_zipfile(path):
+        return f"Файл «{path}» не является документом Word (.docx)."
     return None
 
 
