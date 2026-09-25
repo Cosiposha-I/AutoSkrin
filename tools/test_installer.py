@@ -154,14 +154,23 @@ def check_universal_uninstaller(base: Path, appdata: Path, desktop_link: Path, s
     check(uninstall_key_exists(), "программа есть в списке установленных")
     check(bool(run_key_value("AutoSkrin")), "автозапуск включён")
 
-    # «Версия из исходного кода», как её делает install.bat: папка, .venv и ярлык на рабочем столе
-    source = base / "Разработка" / "AutoSkrin-исходники"
-    (source / ".venv").mkdir(parents=True)
-    (source / "main.py").write_text("# test", encoding="utf-8")
+    # Две «версии из исходного кода», как их делает install.bat (папка с main.py и .venv):
+    #  * source — новая: папка записана в реестр (путь с кириллицей);
+    #  * old_source — старая, без записи в реестре: найти её можно только по ярлыку
+    #    (путь латиницей: ярлыки WScript.Shell портят кириллицу на англоязычной Windows)
+    import winreg
+
     import win32com.client
+    source = base / "Разработка" / "AutoSkrin-исходники"
+    old_source = base / "old-source"
+    for folder in (source, old_source):
+        (folder / ".venv").mkdir(parents=True)
+        (folder / "main.py").write_text("# test", encoding="utf-8")
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\AutoSkrin") as key:
+        winreg.SetValueEx(key, "SourceDir", 0, winreg.REG_SZ, str(source))
     link = win32com.client.Dispatch("WScript.Shell").CreateShortcut(str(desktop_link))
     link.TargetPath = sys.executable
-    link.Arguments = f'"{source / "main.py"}"'
+    link.Arguments = f'"{old_source / "main.py"}"'
     link.Save()
     appdata.mkdir(parents=True, exist_ok=True)
     (appdata / "settings.json").write_text("{}", encoding="utf-8")
@@ -178,7 +187,14 @@ def check_universal_uninstaller(base: Path, appdata: Path, desktop_link: Path, s
     check(not (app_dir / "AutoSkrin.exe").exists(), "установленная версия удалена")
     check(not uninstall_key_exists(), "запись в списке программ удалена")
     check(run_key_value("AutoSkrin") is None, "автозапуск удалён")
-    check(not source.exists(), "папка с исходным кодом удалена (/source)")
+    check(not source.exists(), "версия из исходного кода (найдена по реестру) удалена")
+    check(not old_source.exists(), "старая версия из исходного кода (найдена по ярлыку) удалена")
+    try:
+        winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\AutoSkrin").Close()
+        registry_left = True
+    except OSError:
+        registry_left = False
+    check(not registry_left, "запись о версии из исходного кода в реестре удалена")
     check(not desktop_link.exists(), "ярлык на рабочем столе удалён")
     check(not start_menu.exists(), "папка в меню «Пуск» удалена")
     check(not appdata.exists(), "настройки удалены (/settings)")

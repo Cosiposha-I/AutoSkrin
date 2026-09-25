@@ -71,11 +71,16 @@ foreach ($root in $uninstallRoots) {
     }
 }
 
-# Версии из исходного кода (install.bat): ярлык на рабочем столе и автозапуск указывают на main.py
+# Версии из исходного кода (install.bat). Основной способ — запись в реестре, которую
+# делает install.bat; запасной (для старых установок) — ярлык и автозапуск, указывающие
+# на main.py (в ярлыке кириллица может испортиться, если её нет в кодировке Windows)
+$sourceKey = 'HKCU:\Software\AutoSkrin'
+$sourceDirs = @()
+$registered = (Get-ItemProperty -LiteralPath $sourceKey -Name 'SourceDir' -ErrorAction SilentlyContinue).SourceDir
+if ($registered) { $sourceDirs += $registered }
 $shell = New-Object -ComObject WScript.Shell
 $desktop = [Environment]::GetFolderPath('Desktop')
 $desktopLink = Join-Path $desktop 'AutoSkrin.lnk'
-$sourceDirs = @()
 if (Test-Path -LiteralPath $desktopLink) {
     $link = $shell.CreateShortcut($desktopLink)
     if ($link.Arguments -match '"?([^"]*main\.py)"?') { $sourceDirs += Split-Path -Parent $Matches[1] }
@@ -89,7 +94,8 @@ $settingsDir = Join-Path $env:APPDATA 'AutoSkrin'
 $startMenuDir = Join-Path ([Environment]::GetFolderPath('Programs')) 'AutoSkrin'
 
 if (-not $installs -and -not $sourceDirs -and -not (Test-Path -LiteralPath $desktopLink) -and
-    -not $autorun -and -not (Test-Path -LiteralPath $startMenuDir) -and -not (Test-Path -LiteralPath $settingsDir)) {
+    -not $autorun -and -not (Test-Path -LiteralPath $startMenuDir) -and -not (Test-Path -LiteralPath $settingsDir) -and
+    -not (Test-Path -LiteralPath $sourceKey)) {
     Say 'AutoSkrin на этом компьютере не найден.' 'Yellow'
     Say 'Переносную версию (ZIP) удаляют простым удалением её папки.'
     if (-not $AutoYes) { Read-Host 'Нажмите Enter, чтобы закрыть окно' | Out-Null }
@@ -167,6 +173,7 @@ if (Get-ItemProperty -LiteralPath $runKey -Name 'AutoSkrin' -ErrorAction Silentl
     } catch { Say "  не удалось убрать автозапуск: $($_.Exception.Message)" 'Red'; $Errors++ }
 }
 Remove-Safely (Join-Path $env:TEMP 'AutoSkrin') 'временные файлы'
+Remove-Safely $sourceKey 'запись о версии из исходного кода в реестре'
 
 # --- 6. Настройки ------------------------------------------------------------------
 if (Test-Path -LiteralPath $settingsDir) {

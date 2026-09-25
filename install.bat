@@ -40,6 +40,8 @@ if defined QUIET exit /b 0
 rem --- 3. Ярлык на рабочем столе ---
 set "APPDIR=%~dp0"
 if "%APPDIR:~-1%"=="\" set "APPDIR=%APPDIR:~0,-1%"
+rem Запоминаем папку программы в реестре - по ней uninstall.bat найдёт эту установку
+reg add "HKCU\Software\AutoSkrin" /v SourceDir /t REG_SZ /d "%APPDIR%" /f >nul
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$d=$env:APPDIR; $q=[char]34; $w=New-Object -ComObject WScript.Shell; $s=$w.CreateShortcut([IO.Path]::Combine([Environment]::GetFolderPath('Desktop'), 'AutoSkrin.lnk')); $s.TargetPath=Join-Path $d '.venv\Scripts\pythonw.exe'; $s.Arguments=$q + (Join-Path $d 'main.py') + $q; $s.WorkingDirectory=$d; $s.IconLocation=Join-Path $d 'assets\icon.ico'; $s.Save()"
 if errorlevel 1 (
     echo Не удалось создать ярлык - программу можно запускать файлом run.bat
