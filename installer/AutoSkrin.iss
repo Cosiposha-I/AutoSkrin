@@ -2,7 +2,7 @@
 ; Установщик AutoSkrin (Inno Setup 6, https://jrsoftware.org/isinfo.php)
 ;
 ; Обычно собирается автоматически командой:  python tools\build.py
-; Вручную (после PyInstaller):               iscc /DMyAppVersion=1.1.0 installer\AutoSkrin.iss
+; Вручную (после PyInstaller):               iscc /DMyAppVersion=1.1.1 installer\AutoSkrin.iss
 ;
 ; Всё настраивается в мастере установки:
 ;   * для кого ставить: только для себя (без прав администратора) или для всех;
@@ -25,7 +25,7 @@
 
 #define MyAppName "AutoSkrin"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.1.0"
+  #define MyAppVersion "1.1.1"
 #endif
 #define MyAppExeName "AutoSkrin.exe"
 #define MyAppURL "https://github.com/Cosiposha-I/AutoSkrin"
@@ -92,8 +92,8 @@ russian.OpenManual=Открыть инструкцию
 english.OpenManual=Open the manual
 russian.SavePageTitle=Куда сохранять скриншоты
 english.SavePageTitle=Where to save screenshots
-russian.SavePageDescription=Выберите папку и/или документ Word. Всё это можно изменить позже в программе.
-english.SavePageDescription=Choose a folder and/or a Word document. You can change this later in the program.
+russian.SavePageDescription=Это начальные настройки — их можно менять в любой момент в окне программы.
+english.SavePageDescription=These are initial settings — you can change them at any time in the program window.
 russian.KeepSettings=Оставить текущие настройки программы (найдены от прошлой установки)
 english.KeepSettings=Keep current program settings (found from a previous installation)
 russian.SaveToFolder=Сохранять скриншоты файлами PNG/JPG в папку:
@@ -126,8 +126,8 @@ russian.FormatJpg=JPG (меньше размер)
 english.FormatJpg=JPG (smaller files)
 russian.DetectPageTitle=Как замечать изменения
 english.DetectPageTitle=Change detection
-russian.DetectPageDescription=Чувствительность и поведение программы. Всё это можно изменить позже в программе.
-english.DetectPageDescription=Sensitivity and program behaviour. You can change this later in the program.
+russian.DetectPageDescription=Это начальные настройки — их можно менять в любой момент в окне программы.
+english.DetectPageDescription=These are initial settings — you can change them at any time in the program window.
 russian.IntervalLabel=Интервал проверки, сек:
 english.IntervalLabel=Check interval, sec:
 russian.ThresholdLabel=Порог чувствительности, % пикселей:
