@@ -2,7 +2,7 @@
 ; Установщик AutoSkrin (Inno Setup 6, https://jrsoftware.org/isinfo.php)
 ;
 ; Обычно собирается автоматически командой:  python tools\build.py
-; Вручную (после PyInstaller):               iscc /DMyAppVersion=1.1.1 installer\AutoSkrin.iss
+; Вручную (после PyInstaller):               iscc /DMyAppVersion=1.1.2 installer\AutoSkrin.iss
 ;
 ; Всё настраивается в мастере установки:
 ;   * для кого ставить: только для себя (без прав администратора) или для всех;
@@ -25,7 +25,7 @@
 
 #define MyAppName "AutoSkrin"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.1.1"
+  #define MyAppVersion "1.1.2"
 #endif
 #define MyAppExeName "AutoSkrin.exe"
 #define MyAppURL "https://github.com/Cosiposha-I/AutoSkrin"
@@ -192,6 +192,8 @@ Source: "..\tests\*.py"; DestDir: "{app}\source\tests"; Components: source; Flag
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
+; Понятный ярлык для удаления прямо в папке программы (вместо unins000.exe)
+Name: "{app}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [INI]

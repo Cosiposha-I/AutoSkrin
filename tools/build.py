@@ -5,7 +5,8 @@ build.py — сборка Windows-версии AutoSkrin.
   1. PyInstaller собирает программу в папку dist/AutoSkrin (AutoSkrin.exe + библиотеки);
   2. собранный exe проходит самопроверку (--self-test);
   3. из папки делается переносная версия dist/AutoSkrin-Portable.zip;
-  4. Inno Setup создаёт установщик dist/AutoSkrin-Setup.exe.
+  4. Inno Setup создаёт установщик dist/AutoSkrin-Setup.exe;
+  5. рядом кладётся универсальный деинсталлятор dist/AutoSkrin-Uninstall.bat.
 
 Запуск (из корня проекта, в Windows):
     python tools/build.py                 — всё сразу
@@ -37,6 +38,7 @@ ICON = ROOT / "assets" / "icon.ico"
 ISS = ROOT / "installer" / "AutoSkrin.iss"
 PORTABLE_ZIP = DIST / f"{APP_NAME}-Portable.zip"
 SETUP_EXE = DIST / f"{APP_NAME}-Setup.exe"
+UNINSTALL_BAT = DIST / f"{APP_NAME}-Uninstall.bat"
 
 
 def step(text: str) -> None:
@@ -165,6 +167,9 @@ def main() -> None:
     make_portable_zip()
     if sys.platform == "win32":
         build_installer(args.require_installer)
+    # Универсальный деинсталлятор (удаляет любую версию программы)
+    shutil.copyfile(ROOT / "uninstall.bat", UNINSTALL_BAT)
+    print(f"Готово: {UNINSTALL_BAT}")
 
     # Версия для GitHub Actions (используется при публикации релиза)
     if os.environ.get("GITHUB_OUTPUT"):

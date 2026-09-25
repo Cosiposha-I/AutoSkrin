@@ -24,7 +24,7 @@ from typing import Any
 
 # Общие сведения о приложении (используются в UI, сборке и установщике)
 APP_NAME = "AutoSkrin"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 # Режимы сохранения скриншота
 CAPTURE_REGION = "region"   # только выбранная область

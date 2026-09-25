@@ -50,7 +50,7 @@ jobs:
         id: build
         run: python tools/build.py --require-installer
 
-      - name: Проверка установщика (тихая установка с параметрами и удаление)
+      - name: Проверка установщика и деинсталлятора
         run: python tools/test_installer.py
 
       - name: Сохранить файлы сборки
@@ -60,6 +60,7 @@ jobs:
           path: |
             dist/AutoSkrin-Setup.exe
             dist/AutoSkrin-Portable.zip
+            dist/AutoSkrin-Uninstall.bat
 
       # Релиз обновляется при пуше в основную ветку репозитория или тега v*.
       # Ссылки вида .../releases/latest/download/AutoSkrin-Setup.exe всегда
@@ -75,11 +76,13 @@ jobs:
           NOTES="Автоматическая сборка из коммита ${GITHUB_SHA::7}.
 
           **AutoSkrin-Setup.exe** — установщик: скачайте и запустите, права администратора не нужны.
-          **AutoSkrin-Portable.zip** — переносная версия: распакуйте и запустите AutoSkrin.exe."
+          **AutoSkrin-Portable.zip** — переносная версия: распакуйте и запустите AutoSkrin.exe.
+          **AutoSkrin-Uninstall.bat** — полное удаление любой версии AutoSkrin (запустите двойным щелчком)."
           if [[ "$GITHUB_REF" != refs/tags/* ]]; then
             # Пересоздаём релиз, чтобы тег указывал на свежий коммит
             gh release delete "$TAG" --yes --cleanup-tag || true
           fi
-          gh release create "$TAG" dist/AutoSkrin-Setup.exe dist/AutoSkrin-Portable.zip \
+          FILES="dist/AutoSkrin-Setup.exe dist/AutoSkrin-Portable.zip dist/AutoSkrin-Uninstall.bat"
+          gh release create "$TAG" $FILES \
             --target "$GITHUB_SHA" --title "AutoSkrin ${VERSION}" --notes "$NOTES" --latest \
-            || gh release upload "$TAG" dist/AutoSkrin-Setup.exe dist/AutoSkrin-Portable.zip --clobber
+            || gh release upload "$TAG" $FILES --clobber
