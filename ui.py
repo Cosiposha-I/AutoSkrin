@@ -228,8 +228,13 @@ class GlobalHotkey(QObject):
             ctypes.windll.user32.UnregisterHotKey(None, self._HOTKEY_ID)
             self._win_filter = None
         if self._pynput_listener is not None:
-            self._pynput_listener.stop()
-            self._pynput_listener = None
+            listener, self._pynput_listener = self._pynput_listener, None
+            # pynput на X11 может упасть, если остановить слушатель сразу после запуска;
+            # отмена горячей клавиши не должна ронять программу
+            try:
+                listener.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Ошибка остановки pynput: %s", exc)
 
 
 # ---------------------------------------------------------------------------
