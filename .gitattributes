@@ -1,0 +1,5 @@
+# Bat-файлы хранятся с CRLF как есть — cmd.exe плохо работает с LF
+*.bat -text
+*.ico binary
+*.png binary
+*.iss -text

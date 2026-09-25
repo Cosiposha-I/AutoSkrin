@@ -1,0 +1,79 @@
+# Сборка AutoSkrin для Windows: тесты → exe (PyInstaller) → самопроверка →
+# установщик (Inno Setup) + переносной ZIP → публикация в GitHub Releases.
+name: Сборка установщика для Windows
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # нужно для публикации релиза
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller pytest
+
+      - name: Тесты
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Сборка exe, самопроверка, установщик и ZIP
+        id: build
+        run: python tools/build.py --require-installer
+
+      - name: Сохранить файлы сборки
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoSkrin-windows
+          path: |
+            dist/AutoSkrin-Setup.exe
+            dist/AutoSkrin-Portable.zip
+
+      # Релиз обновляется при пуше в основную ветку репозитория или тега v*.
+      # Ссылки вида .../releases/latest/download/AutoSkrin-Setup.exe всегда
+      # ведут на самую свежую сборку.
+      - name: Публикация релиза
+        if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref_name == github.event.repository.default_branch)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          TAG="v${VERSION}"
+          NOTES="Автоматическая сборка из коммита ${GITHUB_SHA::7}.
+
+          **AutoSkrin-Setup.exe** — установщик: скачайте и запустите, права администратора не нужны.
+          **AutoSkrin-Portable.zip** — переносная версия: распакуйте и запустите AutoSkrin.exe."
+          if [[ "$GITHUB_REF" != refs/tags/* ]]; then
+            # Пересоздаём релиз, чтобы тег указывал на свежий коммит
+            gh release delete "$TAG" --yes --cleanup-tag || true
+          fi
+          gh release create "$TAG" dist/AutoSkrin-Setup.exe dist/AutoSkrin-Portable.zip \
+            --target "$GITHUB_SHA" --title "AutoSkrin ${VERSION}" --notes "$NOTES" --latest \
+            || gh release upload "$TAG" dist/AutoSkrin-Setup.exe dist/AutoSkrin-Portable.zip --clobber
