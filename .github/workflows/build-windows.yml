@@ -18,6 +18,8 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"   # вывод Python в UTF-8 (в журнале сборки есть русский текст)
     steps:
       - uses: actions/checkout@v4
 

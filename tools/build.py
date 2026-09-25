@@ -147,6 +147,12 @@ def build_installer(required: bool) -> None:
 
 
 def main() -> None:
+    # Консоль Windows (и логи CI) могут быть в cp1252/cp866 — выводим в UTF-8,
+    # иначе печать русского текста завершится ошибкой UnicodeEncodeError
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="Сборка AutoSkrin для Windows")
     parser.add_argument("--skip-self-test", action="store_true")
     parser.add_argument("--require-installer", action="store_true")

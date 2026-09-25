@@ -41,6 +41,9 @@ def setup_logging() -> Path:
     handlers: list[logging.Handler] = [
         RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")]
     if sys.stderr is not None:  # в собранном exe без консоли stderr отсутствует
+        if hasattr(sys.stderr, "reconfigure"):
+            # Кириллица не должна ломать вывод в консоль с кодировкой cp1252/cp866
+            sys.stderr.reconfigure(errors="backslashreplace")
         handlers.append(logging.StreamHandler())
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
