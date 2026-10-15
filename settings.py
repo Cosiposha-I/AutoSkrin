@@ -24,7 +24,7 @@ from typing import Any
 
 # Общие сведения о приложении (используются в UI, сборке и установщике)
 APP_NAME = "AutoSkrin"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # Что отслеживать: область экрана или конкретное окно программы
 SOURCE_REGION = "region"
@@ -53,7 +53,8 @@ _OLD_DEFAULT_HOTKEY = "Ctrl+Shift+S"
 # Файл с настройками, выбранными в установщике (лежит рядом с AutoSkrin.exe)
 INSTALLER_DEFAULTS_FILE = "defaults.json"
 _INSTALLER_META_KEYS = ("install_id", "apply_to_existing", "region", "applied_defaults_id",
-                        "source_mode", "window_title", "window_class", "window_exe", "window_crop")
+                        "source_mode", "window_title", "window_class", "window_exe", "window_crop",
+                        "window_tab_only", "window_title_filter")
 
 # Имя параметра автозапуска в реестре Windows
 _AUTORUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -216,6 +217,9 @@ class Settings:
     window_exe: str = ""
     window_from_screen: bool = False    # снимать окно с экрана, а не его содержимое
     window_crop: Crop | None = None     # отслеживать только часть окна (None — всё окно)
+    # «Только эта вкладка»: снимать, только пока в заголовке окна есть этот текст
+    window_tab_only: bool = False
+    window_title_filter: str = ""
     interval_sec: float = 1.0          # как часто проверять область
     threshold_percent: float = 1.0     # сколько % пикселей должно измениться
     pixel_tolerance: int = 12          # насколько (0–255) должен измениться пиксель
@@ -294,14 +298,14 @@ class Settings:
             s.applied_defaults_id = data["applied_defaults_id"]
         if data.get("source_mode") in SOURCE_MODES:
             s.source_mode = data["source_mode"]
-        for key in ("window_title", "window_class", "window_exe"):
+        for key in ("window_title", "window_class", "window_exe", "window_title_filter"):
             if isinstance(data.get(key), str):
                 setattr(s, key, data[key])
 
         # Логические флаги
         for key in ("notifications_enabled", "autostart_monitoring", "minimize_to_tray",
                     "save_to_folder", "save_to_docx", "docx_captions", "timer_enabled",
-                    "window_from_screen"):
+                    "window_from_screen", "window_tab_only"):
             if isinstance(data.get(key), bool):
                 setattr(s, key, data[key])
 
@@ -317,6 +321,10 @@ class Settings:
         s.region = Region.from_dict(data.get("region"))
         s.window_crop = Crop.from_dict(data.get("window_crop"))
         return s
+
+    def tab_filter(self) -> str:
+        """Текст, который должен быть в заголовке окна («только эта вкладка»); пусто — не важно."""
+        return self.window_title_filter.strip() if self.window_tab_only else ""
 
     def has_window(self) -> bool:
         """Выбрано ли окно для отслеживания."""

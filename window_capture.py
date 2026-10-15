@@ -11,6 +11,11 @@ Windows:
 Можно отслеживать не всё окно, а его часть (Crop — отступы от краёв окна,
 как фильтр «Обрезка» в OBS).
 
+«Только эта вкладка» (для браузеров): браузер рисует лишь открытую вкладку,
+а её название всегда видно в заголовке окна. Поэтому снимки делаются, только
+пока заголовок содержит заданный текст; переключились на другую вкладку
+(например, на мессенджер) — снимки на паузе.
+
 Выбранное окно запоминается по заголовку, классу окна и имени программы.
 Если программу закрыли и открыли снова, окно находится заново: сначала по
 точному заголовку, затем по «типу» окна (класс + программа) — как в OBS.
@@ -38,6 +43,13 @@ WINDOW_CAPTURE_SUPPORTED = sys.platform == "win32"
 FOUND = "found"          # окно есть и его можно снимать
 MINIMIZED = "minimized"  # окно свёрнуто или скрыто
 MISSING = "missing"      # окна нет (программа закрыта)
+OTHER_TAB = "other_tab"  # в окне открыта другая вкладка — снимать нельзя
+
+# Браузеры и окончания, которые они добавляют к названию вкладки в заголовке окна
+BROWSER_EXES = {"chrome.exe", "msedge.exe", "firefox.exe", "browser.exe", "opera.exe",
+                "brave.exe", "vivaldi.exe", "chromium.exe", "yandex.exe"}
+_BROWSER_SUFFIXES = ("google chrome", "microsoft edge", "mozilla firefox", "яндекс браузер",
+                     "yandex browser", "opera", "brave", "vivaldi", "chromium")
 
 
 @dataclass(frozen=True)
@@ -59,16 +71,46 @@ def window_label(title: str, exe: str) -> str:
     return f"[{exe}] {title}" if exe else title
 
 
+def is_browser(exe: str) -> bool:
+    return exe.lower() in BROWSER_EXES
+
+
+def tab_title(title: str, exe: str = "") -> str:
+    """
+    Название вкладки без названия браузера:
+    «Лекция 5 — YouTube - Google Chrome» → «Лекция 5 — YouTube».
+    """
+    for sep in (" - ", " — ", " – "):
+        head, found, tail = title.rpartition(sep)
+        if found and head and any(name in tail.lower() for name in _BROWSER_SUFFIXES):
+            return head.strip()
+    return title.strip()
+
+
+def title_matches(title: str, keyword: str) -> bool:
+    """Есть ли в заголовке окна нужный текст (без учёта регистра)."""
+    return keyword.strip().lower() in title.lower()
+
+
 def match_window(windows: list[WindowInfo], title: str, class_name: str, exe: str,
-                 last_hwnd: int | None = None) -> WindowInfo | None:
+                 last_hwnd: int | None = None, title_filter: str = "") -> WindowInfo | None:
     """
     Находит запомненное окно среди открытых:
+      0) если задана «только эта вкладка» — окно той же программы, где она открыта
+         (вкладку могли перетащить в отдельное окно);
       1) то же самое окно (тот же дескриптор) той же программы;
       2) окно той же программы с точно таким же заголовком;
       3) окно той же программы и того же класса (заголовок мог смениться,
          например у браузера при переключении вкладки) — несвёрнутое в приоритете.
     """
     same_exe = [w for w in windows if not exe or w.exe.lower() == exe.lower()]
+    if title_filter.strip():
+        with_tab = [w for w in same_exe if title_matches(w.title, title_filter)]
+        for w in with_tab:
+            if w.hwnd == last_hwnd or not w.minimized:
+                return w
+        if with_tab:
+            return with_tab[0]
     if last_hwnd is not None:
         for w in same_exe:
             if w.hwnd == last_hwnd:
@@ -125,10 +167,11 @@ class WindowTracker:
     (в Windows — WinApi; в тестах можно подставить заглушку).
     """
 
-    def __init__(self, title: str, class_name: str, exe: str, api=None):
+    def __init__(self, title: str, class_name: str, exe: str, api=None, title_filter: str = ""):
         self.title = title
         self.class_name = class_name
         self.exe = exe
+        self.title_filter = title_filter.strip()  # «только эта вкладка» (пусто — выключено)
         self.api = api if api is not None else default_api()
         self.window: WindowInfo | None = None
 
@@ -146,12 +189,28 @@ class WindowTracker:
             # Дескриптор мог достаться окну другой программы
             if info is not None and self.exe and info.exe.lower() != self.exe.lower():
                 info = None
-        if info is None:
-            info = match_window(self.api.list_windows(), self.title, self.class_name, self.exe)
+        # Нужной вкладки в этом окне нет — может, её перетащили в другое окно браузера
+        if info is None or (self.title_filter and not title_matches(info.title, self.title_filter)):
+            found = match_window(self.api.list_windows(), self.title, self.class_name, self.exe,
+                                 info.hwnd if info else None, self.title_filter)
+            info = found or info
         self.window = info
         if info is None:
             return MISSING
-        return MINIMIZED if info.minimized else FOUND
+        if info.minimized:
+            return MINIMIZED
+        if self.title_filter and not title_matches(info.title, self.title_filter):
+            return OTHER_TAB
+        return FOUND
+
+    def still_on_tab(self) -> bool:
+        """Проверка после снимка: вкладку не переключили, пока окно снималось."""
+        if not self.title_filter:
+            return True
+        if self.window is None:
+            return False
+        info = self.api.window_info(self.window.hwnd)
+        return info is not None and not info.minimized and title_matches(info.title, self.title_filter)
 
     def capture(self) -> np.ndarray | None:
         """Содержимое окна (BGRA), даже если оно перекрыто. None — не удалось."""

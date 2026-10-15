@@ -4,8 +4,9 @@ import numpy as np
 import pytest
 
 from settings import Crop, Region, Settings
-from window_capture import (FOUND, MINIMIZED, MISSING, WindowInfo, WindowTracker,
-                            bgra_has_content, crop_frame, cropped_area, match_window)
+from window_capture import (FOUND, MINIMIZED, MISSING, OTHER_TAB, WindowInfo, WindowTracker,
+                            bgra_has_content, crop_frame, cropped_area, is_browser, match_window,
+                            tab_title, title_matches)
 
 CHROME = WindowInfo(101, "Лекция 1 — Google Chrome", "Chrome_WidgetWin_1", "chrome.exe")
 CHROME_2 = WindowInfo(102, "Почта — Google Chrome", "Chrome_WidgetWin_1", "chrome.exe")
@@ -161,7 +162,8 @@ def monitor_with_window(qapp):
         settings = Settings(source_mode="window", window_title=CHROME.title,
                             window_class=CHROME.class_name, window_exe="chrome.exe", **cfg)
         mon = ScreenMonitor(settings)
-        mon._tracker = WindowTracker(CHROME.title, CHROME.class_name, "chrome.exe", api=api)
+        mon._tracker = WindowTracker(CHROME.title, CHROME.class_name, "chrome.exe", api=api,
+                                     title_filter=settings.tab_filter())
         mon.logs = []
         mon.log_message.connect(lambda text, level: mon.logs.append((level, text)))
         return mon, settings, ChangeDetector(1, 0, 0)
@@ -222,3 +224,67 @@ def test_grab_window_waits_while_minimized_or_closed(monitor_with_window):
     got, _ = mon._grab_window(FakeSct(), cfg, det)
     assert got[0, 0, 0] == 9
     assert any("снова доступно" in text for _, text in mon.logs)
+
+
+# --- «только эта вкладка» в браузере ---
+
+def test_tab_title_strips_browser_name():
+    assert tab_title("Лекция 5 — YouTube - Google Chrome") == "Лекция 5 — YouTube"
+    assert tab_title("Вебинар — Личный: Microsoft Edge") == "Вебинар"
+    assert tab_title("Zoom — Mozilla Firefox") == "Zoom"
+    assert tab_title("Конспект.docx - Word") == "Конспект.docx - Word"   # не браузер
+    assert is_browser("Chrome.exe") and not is_browser("WINWORD.EXE")
+    assert title_matches("Лекция 5 — YouTube - Google Chrome", "youtube")
+
+
+def chrome(hwnd, title, minimized=False):
+    return WindowInfo(hwnd, title, "Chrome_WidgetWin_1", "chrome.exe", minimized)
+
+
+def test_tracker_pauses_on_other_tab_and_follows_dragged_tab():
+    api = FakeApi([chrome(101, "Лекция 5 — YouTube - Google Chrome")])
+    tracker = WindowTracker("Лекция 5 — YouTube - Google Chrome", "Chrome_WidgetWin_1", "chrome.exe",
+                            api=api, title_filter="Лекция 5")
+    assert tracker.update() == FOUND
+    api.windows[101] = chrome(101, "Telegram Web - Google Chrome")       # переключили вкладку
+    assert tracker.update() == OTHER_TAB
+    api.windows[202] = chrome(202, "Лекция 5 — YouTube - Google Chrome")  # вкладку вытащили в окно
+    assert tracker.update() == FOUND and tracker.window.hwnd == 202
+
+
+@pytest.fixture
+def tab_monitor(monitor_with_window):
+    def make(api):
+        return monitor_with_window(api, window_tab_only=True, window_title_filter="Лекция 5")
+    return make
+
+
+def test_other_tab_is_not_captured_and_not_logged(tab_monitor):
+    api = FakeApi([chrome(101, "Лекция 5 — YouTube - Google Chrome")], frames={101: frame(value=50)})
+    mon, cfg, det = tab_monitor(api)
+    assert mon._grab_window(FakeSct(), cfg, det) is not None
+
+    api.windows[101] = chrome(101, "Секретный чат — Telegram Web - Google Chrome")
+    sct = FakeSct()
+    assert mon._grab_window(sct, cfg, det) is None
+    assert mon._grab_window(sct, cfg, det) is None
+    assert sct.grabbed == []                                      # ничего не снимали
+    log_text = " ".join(text for _, text in mon.logs)
+    assert log_text.count("другая вкладка") == 1
+    assert "Секретный чат" not in log_text                        # название чужой вкладки не в журнале
+
+    api.windows[101] = chrome(101, "Лекция 5 — YouTube - Google Chrome")
+    assert mon._grab_window(FakeSct(), cfg, det) is not None
+    assert any("снова открыта" in text for _, text in mon.logs)
+
+
+def test_frame_discarded_if_tab_switched_during_capture(tab_monitor):
+    api = FakeApi([chrome(101, "Лекция 5 — YouTube - Google Chrome")])
+
+    def capture_while_switching(hwnd):
+        api.windows[101] = chrome(101, "Почта - Google Chrome")   # переключили во время снимка
+        return frame(value=50)
+
+    api.capture = capture_while_switching
+    mon, cfg, det = tab_monitor(api)
+    assert mon._grab_window(FakeSct(), cfg, det) is None

@@ -31,8 +31,8 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from settings import (CAPTURE_ALL, CAPTURE_REGION, CAPTURE_SCREEN, SOURCE_WINDOW, TIMER_AT, Region,
                       Settings, parse_hhmm)
-from window_capture import (FOUND, MINIMIZED, WindowTracker, bgra_has_content, crop_frame,
-                            cropped_area, window_label)
+from window_capture import (FOUND, MINIMIZED, OTHER_TAB, WindowTracker, bgra_has_content,
+                            crop_frame, cropped_area, window_label)
 from word_doc import ADDED_TO_WORD, PENDING, WordDocumentWriter
 
 log = logging.getLogger(__name__)
@@ -309,7 +309,7 @@ class ScreenMonitor(QThread):
                     self.fatal_error.emit("Не выбрано окно для мониторинга.")
                     return
                 key = (SOURCE_WINDOW, cfg.window_title, cfg.window_class, cfg.window_exe,
-                       cfg.window_crop)
+                       cfg.window_crop, cfg.tab_filter())
             else:
                 if cfg.region is None:
                     self.fatal_error.emit("Не выбрана область для мониторинга.")
@@ -320,7 +320,8 @@ class ScreenMonitor(QThread):
                     self.log_message.emit(self._source_text(cfg), "info")
                 source_key = key
                 detector.reset()
-                self._tracker = (WindowTracker(cfg.window_title, cfg.window_class, cfg.window_exe)
+                self._tracker = (WindowTracker(cfg.window_title, cfg.window_class, cfg.window_exe,
+                                               title_filter=cfg.tab_filter())
                                  if cfg.source_mode == SOURCE_WINDOW else None)
                 self._window_state = None
                 self._black_warned = False
@@ -391,14 +392,22 @@ class ScreenMonitor(QThread):
         tracker = self._tracker
         previous = tracker.window
         state = tracker.update()
-        label = tracker.window.label() if tracker.window else tracker.label()
+        tab = tracker.title_filter
+        # С «только этой вкладкой» в журнал не пишем текущий заголовок окна:
+        # там может оказаться название чужой вкладки (например, чата в мессенджере)
+        label = tracker.window.label() if tracker.window and not tab else tracker.label()
         if state != self._window_state:
             if state == MINIMIZED:
                 self.log_message.emit(f"Окно {label} свёрнуто — жду, когда его развернут", "info")
+            elif state == OTHER_TAB:
+                self.log_message.emit(
+                    f"Открыта другая вкладка — снимки на паузе, пока не вернётесь на «{tab}»", "info")
             elif state != FOUND:
                 self.log_message.emit(
                     f"Окно {tracker.label()} не найдено (программа закрыта?) — жду, когда оно появится",
                     "warning")
+            elif self._window_state == OTHER_TAB:
+                self.log_message.emit(f"Вкладка «{tab}» снова открыта — снимки продолжаются", "info")
             elif self._window_state is not None:
                 self.log_message.emit(f"Окно снова доступно: {label}", "info")
             self._window_state = state
@@ -430,6 +439,9 @@ class ScreenMonitor(QThread):
                     "(не перекрывайте его другими окнами)", "warning")
         if frame is None:
             frame = shot_to_array(sct.grab(area.as_mss()))
+        # Вкладку переключили, пока окно снималось, — такой кадр не используем
+        if not tracker.still_on_tab():
+            return None
         return frame, area
 
     def _save(self, sct, cfg: Settings, area: Region | None, frame: np.ndarray) -> tuple[str, str]:

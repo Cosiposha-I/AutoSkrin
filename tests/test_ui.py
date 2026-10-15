@@ -207,3 +207,22 @@ def test_window_crop_dialog_selection(qapp):
     existing = WindowCropDialog(None, np.full((300, 400, 4), 90, dtype=np.uint8),
                                 Crop(10, 20, 30, 40), "[x.exe] Окно")
     assert existing.crop() == Crop(10, 20, 30, 40)              # прежнее выделение показано
+
+
+def test_browser_window_enables_tab_guard(window, monkeypatch):
+    import ui
+    from window_capture import WindowInfo
+    monkeypatch.setattr(ui, "WINDOW_CAPTURE_SUPPORTED", True)
+    window._apply_window(WindowInfo(7, "Лекция 5 — YouTube - Google Chrome", "Chrome_WidgetWin_1",
+                                    "chrome.exe"))
+    s = window.settings
+    assert s.window_tab_only and s.window_title_filter == "Лекция 5 — YouTube"
+    assert window.tab_check.isChecked() and window.tab_edit.text() == "Лекция 5 — YouTube"
+    assert "только пока открыта вкладка" in window.log_view.toPlainText()
+    # Ключевое слово вместо полного названия
+    window.tab_edit.setText("YouTube")
+    window._on_tab_guard_changed()
+    assert s.tab_filter() == "YouTube"
+    # Не браузер — защита вкладки выключена
+    window._apply_window(WindowInfo(8, "Zoom Meeting", "ZPContentViewWndClass", "Zoom.exe"))
+    assert not s.window_tab_only and s.tab_filter() == ""

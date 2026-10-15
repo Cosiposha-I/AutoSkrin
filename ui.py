@@ -34,8 +34,9 @@ from settings import (APP_NAME, APP_VERSION, CAPTURE_ALL, CAPTURE_REGION, CAPTUR
                       DEFAULT_HOTKEY, SOURCE_REGION, SOURCE_WINDOW, TIMER_AFTER, TIMER_AT, Region,
                       Settings, autorun_supported, check_docx_target, check_folder_writable,
                       get_config_path, is_autorun_enabled, parse_hhmm, save_settings, set_autorun)
-from window_capture import (FOUND, MINIMIZED, WINDOW_CAPTURE_SUPPORTED, WindowInfo, WindowTracker,
-                            bgra_has_content, cropped_area, window_label)
+from window_capture import (FOUND, MINIMIZED, OTHER_TAB, WINDOW_CAPTURE_SUPPORTED, WindowInfo,
+                            WindowTracker, bgra_has_content, cropped_area, is_browser, tab_title,
+                            window_label)
 from window_selector import WindowCropDialog, WindowPickerDialog
 from word_doc import ensure_document
 
@@ -431,6 +432,20 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.window_label, 1, 1)
         grid.addLayout(crop_row, 2, 1)
         grid.addWidget(self.window_screen_check, 3, 1)
+
+        # «Только эта вкладка»: в браузере снимать, только пока открыта нужная вкладка
+        self.tab_check = QCheckBox("Только эта вкладка — снимать, пока в заголовке окна есть:")
+        self.tab_check.setToolTip(
+            "Браузер показывает только открытую вкладку, а её название видно в заголовке окна.\n"
+            "Переключились на другую вкладку (например, на мессенджер) — снимки на паузе,\n"
+            "вернулись — продолжаются. Можно оставить только ключевое слово, например «YouTube».")
+        self.tab_check.toggled.connect(self._on_tab_guard_changed)
+        self.tab_edit = QLineEdit(placeholderText="название вкладки или ключевое слово")
+        self.tab_edit.editingFinished.connect(self._on_tab_guard_changed)
+        tab_row = QHBoxLayout()
+        tab_row.addWidget(self.tab_check)
+        tab_row.addWidget(self.tab_edit, 1)
+        grid.addLayout(tab_row, 4, 1)
         grid.setColumnStretch(1, 1)
         return box
 
@@ -651,6 +666,8 @@ class MainWindow(QMainWindow):
             (self.window_radio if s.source_mode == SOURCE_WINDOW and WINDOW_CAPTURE_SUPPORTED
              else self.region_radio).setChecked(True)
             self.window_screen_check.setChecked(s.window_from_screen)
+            self.tab_check.setChecked(s.window_tab_only)
+            self.tab_edit.setText(s.window_title_filter)
             self.folder_check.setChecked(s.save_to_folder)
             self.folder_edit.setText(s.save_dir)
             self.docx_check.setChecked(s.save_to_docx)
@@ -730,6 +747,8 @@ class MainWindow(QMainWindow):
                 '<span style="color:#C98A00">не выбрано — нажмите «Выбрать окно»</span>')
         window_mode = s.source_mode == SOURCE_WINDOW and WINDOW_CAPTURE_SUPPORTED
         self.window_screen_check.setEnabled(window_mode)
+        self.tab_check.setEnabled(window_mode and s.has_window())
+        self.tab_edit.setEnabled(window_mode and s.has_window() and s.window_tab_only)
         if s.window_crop is None:
             self.crop_label.setText("Снимается: всё окно")
         else:
@@ -744,6 +763,21 @@ class MainWindow(QMainWindow):
         if s.source_mode == SOURCE_WINDOW:
             return s.has_window()
         return s.region is not None
+
+    def _on_tab_guard_changed(self, *_args) -> None:
+        if self._loading:
+            return
+        s = self.settings
+        tab_only, text = self.tab_check.isChecked(), self.tab_edit.text().strip()
+        if (tab_only, text) == (s.window_tab_only, s.window_title_filter):
+            return
+        if tab_only and not text:
+            text = tab_title(s.window_title, s.window_exe)  # по умолчанию — вкладка, выбранная с окном
+            self.tab_edit.setText(text)
+        s.window_tab_only, s.window_title_filter = tab_only, text
+        self._update_region_label()
+        self._settings_changed()
+        self._log(f"Снимки только на вкладке «{text}»" if tab_only else "Снимается любая вкладка окна")
 
     def _on_source_toggled(self, _checked: bool) -> None:
         if self._loading:
@@ -985,13 +1019,14 @@ class MainWindow(QMainWindow):
         if s.source_mode == SOURCE_WINDOW:
             if not s.has_window():
                 return
-            tracker = WindowTracker(s.window_title, s.window_class, s.window_exe)
+            tracker = WindowTracker(s.window_title, s.window_class, s.window_exe,
+                                    title_filter=s.tab_filter())
             state = tracker.update()
             label = window_label(s.window_title, s.window_exe)
             if state == MINIMIZED:
                 self._log(f"Окно {label} сейчас свёрнуто", "warning")
                 return
-            if state != FOUND:
+            if state not in (FOUND, OTHER_TAB):
                 self._log(f"Окно {label} сейчас не найдено (программа закрыта?)", "warning")
                 return
             region = tracker.screen_region()
@@ -1032,12 +1067,20 @@ class MainWindow(QMainWindow):
             s.window_crop = None  # другое окно — прежняя область в нём не подходит
         s.window_title, s.window_class, s.window_exe = info.title, info.class_name, info.exe
         s.source_mode = SOURCE_WINDOW
+        # Окно браузера: по умолчанию снимаем только открытую сейчас вкладку
+        s.window_tab_only = is_browser(info.exe)
+        s.window_title_filter = tab_title(info.title, info.exe) if s.window_tab_only else ""
         self._loading, was_loading = True, self._loading
         self.window_radio.setChecked(True)
+        self.tab_check.setChecked(s.window_tab_only)
+        self.tab_edit.setText(s.window_title_filter)
         self._loading = was_loading
         self._update_region_label()
         self._settings_changed()
         self._log(f"Выбрано окно: {info.label()}")
+        if s.window_tab_only:
+            self._log(f"Это браузер: снимки будут делаться, только пока открыта вкладка "
+                      f"«{s.window_title_filter}». На других вкладках — пауза.", "success")
 
     def select_window_crop(self) -> None:
         """Выбор части окна на его снимке (как «Обрезка» в OBS)."""
@@ -1045,8 +1088,14 @@ class MainWindow(QMainWindow):
         if not s.has_window():
             return
         label = window_label(s.window_title, s.window_exe)
-        tracker = WindowTracker(s.window_title, s.window_class, s.window_exe)
+        tracker = WindowTracker(s.window_title, s.window_class, s.window_exe,
+                                title_filter=s.tab_filter())
         state = tracker.update()
+        if state == OTHER_TAB:
+            # Не показываем снимок чужой вкладки (там могут быть личные данные)
+            QMessageBox.information(self, APP_NAME, f"Откройте в браузере вкладку «{s.tab_filter()}», "
+                                                    "чтобы выбрать на ней область.")
+            return
         if state != FOUND:
             reason = "свёрнуто — разверните его" if state == MINIMIZED else \
                 "не найдено — откройте программу"
