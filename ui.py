@@ -21,26 +21,30 @@ from PyQt6.QtCore import (QAbstractNativeEventFilter, QCoreApplication, QObject,
                           Qt, QTime, QTimer, QUrl, pyqtSignal)
 from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QIcon, QKeySequence, QLinearGradient,
                          QPainter, QPen, QPixmap, QShortcut)
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-                             QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
-                             QKeySequenceEdit, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-                             QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QStyle,
-                             QSystemTrayIcon, QTimeEdit, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
+                             QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
+                             QGroupBox, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit,
+                             QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
+                             QRadioButton, QScrollArea, QSpinBox, QStyle, QSystemTrayIcon,
+                             QTimeEdit, QVBoxLayout, QWidget)
 
-from monitor import ScreenMonitor, format_duration, timer_deadline
+from monitor import ScreenMonitor, create_mss, format_duration, shot_to_array, timer_deadline
 from region_selector import RegionHighlighter, RegionSelector, region_on_screens
 from settings import (APP_NAME, APP_VERSION, CAPTURE_ALL, CAPTURE_REGION, CAPTURE_SCREEN,
-                      DEFAULT_HOTKEY, TIMER_AFTER, TIMER_AT, Region, Settings, autorun_supported,
-                      check_docx_target, check_folder_writable, get_config_path,
-                      is_autorun_enabled, parse_hhmm, save_settings, set_autorun)
+                      DEFAULT_HOTKEY, SOURCE_REGION, SOURCE_WINDOW, TIMER_AFTER, TIMER_AT, Region,
+                      Settings, autorun_supported, check_docx_target, check_folder_writable,
+                      get_config_path, is_autorun_enabled, parse_hhmm, save_settings, set_autorun)
+from window_capture import (FOUND, MINIMIZED, WINDOW_CAPTURE_SUPPORTED, WindowInfo, WindowTracker,
+                            bgra_has_content, cropped_area, window_label)
+from window_selector import WindowCropDialog, WindowPickerDialog
 from word_doc import ensure_document
 
 log = logging.getLogger(__name__)
 
 # Подписи режимов сохранения для выпадающего списка
 CAPTURE_LABELS = [
-    (CAPTURE_REGION, "Только выбранную область"),
-    (CAPTURE_SCREEN, "Весь экран (монитор с областью)"),
+    (CAPTURE_REGION, "Только выбранную область или окно"),
+    (CAPTURE_SCREEN, "Весь экран (монитор, где область или окно)"),
     (CAPTURE_ALL, "Все мониторы целиком"),
 ]
 
@@ -331,12 +335,25 @@ class MainWindow(QMainWindow):
         self.select_btn.setMinimumHeight(42)
         self.select_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton))
         self.select_btn.clicked.connect(self.select_region)
-        self.show_region_btn = QPushButton("Показать область")
+        self.select_window_btn = QPushButton("  Выбрать окно")
+        self.select_window_btn.setMinimumHeight(42)
+        self.select_window_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarNormalButton))
+        self.select_window_btn.clicked.connect(self.select_window)
+        if WINDOW_CAPTURE_SUPPORTED:
+            self.select_window_btn.setToolTip(
+                "Отслеживать конкретное окно программы (как «Захват окна» в OBS)")
+        else:
+            self.select_window_btn.setEnabled(False)
+            self.select_window_btn.setToolTip("Захват окна доступен только в Windows")
+        self.show_region_btn = QPushButton("Показать")
         self.show_region_btn.setMinimumHeight(42)
-        self.show_region_btn.setToolTip("Подсветить выбранную область красной рамкой на пару секунд")
+        self.show_region_btn.setToolTip(
+            "Подсветить отслеживаемую область или окно красной рамкой на пару секунд")
         self.show_region_btn.clicked.connect(self.highlight_region)
         buttons.addWidget(self.start_btn, 2)
         buttons.addWidget(self.select_btn, 2)
+        buttons.addWidget(self.select_window_btn, 2)
         buttons.addWidget(self.show_region_btn, 1)
         root.addLayout(buttons)
         root.addLayout(self._build_timer_row())
@@ -370,11 +387,51 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.check_label)
 
     def _build_region_group(self) -> QGroupBox:
-        box = QGroupBox("Область мониторинга")
-        lay = QVBoxLayout(box)
+        """Что отслеживать: область экрана или окно программы."""
+        box = QGroupBox("Что отслеживать")
+        grid = QGridLayout(box)
+        self.source_group = QButtonGroup(self)
+        self.region_radio = QRadioButton("Область экрана:")
+        self.window_radio = QRadioButton("Окно программы:")
+        self.source_group.addButton(self.region_radio)
+        self.source_group.addButton(self.window_radio)
+        self.window_radio.setEnabled(WINDOW_CAPTURE_SUPPORTED)
+        self.region_radio.toggled.connect(self._on_source_toggled)
+
         self.region_label = QLabel()
         self.region_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        lay.addWidget(self.region_label)
+        self.window_label = QLabel()
+        self.window_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.window_label.setWordWrap(True)
+        self.window_screen_check = QCheckBox(
+            "Снимать окно с экрана (если вместо окна получается чёрная картинка)")
+        self.window_screen_check.setToolTip(
+            "Обычно окно снимается целиком, даже если его перекрывают другие окна.\n"
+            "Некоторые программы (игры, видеоплееры) так снять нельзя — тогда окно\n"
+            "снимается прямо с экрана, и перекрывать его другими окнами нельзя.")
+        self.window_screen_check.toggled.connect(lambda v: self._set("window_from_screen", v))
+
+        # Часть окна (как «Обрезка» в OBS)
+        self.crop_label = QLabel()
+        self.crop_label.setWordWrap(True)
+        self.crop_btn = QPushButton("Область в окне…")
+        self.crop_btn.setToolTip("Выделить в окне только нужную часть — например, слайды без чата")
+        self.crop_btn.clicked.connect(self.select_window_crop)
+        self.whole_window_btn = QPushButton("Всё окно")
+        self.whole_window_btn.setToolTip("Отслеживать окно целиком")
+        self.whole_window_btn.clicked.connect(self.reset_window_crop)
+        crop_row = QHBoxLayout()
+        crop_row.addWidget(self.crop_label, 1)
+        crop_row.addWidget(self.crop_btn)
+        crop_row.addWidget(self.whole_window_btn)
+
+        grid.addWidget(self.region_radio, 0, 0)
+        grid.addWidget(self.region_label, 0, 1)
+        grid.addWidget(self.window_radio, 1, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self.window_label, 1, 1)
+        grid.addLayout(crop_row, 2, 1)
+        grid.addWidget(self.window_screen_check, 3, 1)
+        grid.setColumnStretch(1, 1)
         return box
 
     def _build_timer_row(self) -> QHBoxLayout:
@@ -569,6 +626,8 @@ class MainWindow(QMainWindow):
         self.tray_toggle_action = menu.addAction("Старт")
         self.tray_toggle_action.triggered.connect(self.toggle_monitoring)
         menu.addAction("Выбрать область").triggered.connect(self.select_region)
+        if WINDOW_CAPTURE_SUPPORTED:
+            menu.addAction("Выбрать окно").triggered.connect(self.select_window)
         menu.addAction("Открыть папку со скриншотами").triggered.connect(self.open_folder)
         self.tray_notify_action = QAction("Уведомления о скриншотах", self, checkable=True)
         self.tray_notify_action.toggled.connect(self.notify_check.setChecked)
@@ -589,6 +648,9 @@ class MainWindow(QMainWindow):
         s = self.settings
         self._loading = True
         try:
+            (self.window_radio if s.source_mode == SOURCE_WINDOW and WINDOW_CAPTURE_SUPPORTED
+             else self.region_radio).setChecked(True)
+            self.window_screen_check.setChecked(s.window_from_screen)
             self.folder_check.setChecked(s.save_to_folder)
             self.folder_edit.setText(s.save_dir)
             self.docx_check.setChecked(s.save_to_docx)
@@ -638,7 +700,7 @@ class MainWindow(QMainWindow):
         style.polish(self.start_btn)
 
         self.counter_label.setText(f"Скриншотов: <b>{self.shot_count}</b>")
-        self.show_region_btn.setEnabled(self.settings.region is not None)
+        self.show_region_btn.setEnabled(self._source_chosen())
         if self.tray:
             self.tray.setIcon(self._icons[running])
             self.tray_toggle_action.setText("Пауза" if running else "Старт")
@@ -649,15 +711,51 @@ class MainWindow(QMainWindow):
             self.tray.setToolTip(tip)
 
     def _update_region_label(self) -> None:
-        region = self.settings.region
+        """Подписи выбранной области и выбранного окна."""
+        s = self.settings
+        region = s.region
         if region is None:
             self.region_label.setText(
-                '<span style="color:#C98A00">Область не выбрана — нажмите «Выбрать область»</span>')
+                '<span style="color:#C98A00">не выбрана — нажмите «Выбрать область»</span>')
         else:
             self.region_label.setText(
                 f"<b>X:</b> {region.left} &nbsp; <b>Y:</b> {region.top} &nbsp;&nbsp; "
                 f"<b>Ширина:</b> {region.width} px &nbsp; <b>Высота:</b> {region.height} px")
-        self.show_region_btn.setEnabled(region is not None)
+        if not WINDOW_CAPTURE_SUPPORTED:
+            self.window_label.setText('<span style="color:#808080">доступно только в Windows</span>')
+        elif s.has_window():
+            self.window_label.setText(f"<b>{html.escape(window_label(s.window_title, s.window_exe))}</b>")
+        else:
+            self.window_label.setText(
+                '<span style="color:#C98A00">не выбрано — нажмите «Выбрать окно»</span>')
+        window_mode = s.source_mode == SOURCE_WINDOW and WINDOW_CAPTURE_SUPPORTED
+        self.window_screen_check.setEnabled(window_mode)
+        if s.window_crop is None:
+            self.crop_label.setText("Снимается: всё окно")
+        else:
+            self.crop_label.setText(f"Снимается часть окна ({s.window_crop})")
+        self.crop_btn.setEnabled(window_mode and s.has_window())
+        self.whole_window_btn.setEnabled(window_mode and s.window_crop is not None)
+        self.show_region_btn.setEnabled(self._source_chosen())
+
+    def _source_chosen(self) -> bool:
+        """Выбран ли источник для текущего режима (область или окно)."""
+        s = self.settings
+        if s.source_mode == SOURCE_WINDOW:
+            return s.has_window()
+        return s.region is not None
+
+    def _on_source_toggled(self, _checked: bool) -> None:
+        if self._loading:
+            return
+        mode = SOURCE_WINDOW if self.window_radio.isChecked() else SOURCE_REGION
+        if mode == self.settings.source_mode:
+            return
+        self.settings.source_mode = mode
+        self._update_region_label()
+        self._settings_changed()
+        self._log("Отслеживается окно программы" if mode == SOURCE_WINDOW
+                  else "Отслеживается область экрана")
 
     def _reset_counter(self) -> None:
         self.shot_count = 0
@@ -701,8 +799,24 @@ class MainWindow(QMainWindow):
             return True
         s = self.settings
 
-        # Проверка 1: выбрана ли область
-        if s.region is None:
+        # Проверка 1: выбран ли источник (окно или область)
+        if s.source_mode == SOURCE_WINDOW:
+            if not WINDOW_CAPTURE_SUPPORTED:
+                return self._start_refused(
+                    "Захват окна доступен только в Windows — выберите область экрана.", interactive)
+            if not s.has_window():
+                self._log("Мониторинг не запущен: не выбрано окно", "warning")
+                if interactive:
+                    answer = QMessageBox.question(
+                        self, APP_NAME, "Окно для мониторинга ещё не выбрано.\n\nВыбрать его сейчас?")
+                    if answer == QMessageBox.StandardButton.Yes:
+                        self._start_after_select = True
+                        self.select_window()
+                else:
+                    self._notify("Мониторинг не запущен", "Сначала выберите окно",
+                                 QSystemTrayIcon.MessageIcon.Warning)
+                return False
+        elif s.region is None:
             self._log("Мониторинг не запущен: не выбрана область", "warning")
             if interactive:
                 answer = QMessageBox.question(
@@ -716,7 +830,7 @@ class MainWindow(QMainWindow):
             return False
 
         # Проверка 2: видна ли область на подключённых мониторах
-        if not region_on_screens(s.region):
+        if s.source_mode != SOURCE_WINDOW and not region_on_screens(s.region):
             msg = ("Выбранная область находится за пределами экранов "
                    "(возможно, монитор отключён). Выберите область заново.")
             self._log(msg, "warning")
@@ -763,9 +877,11 @@ class MainWindow(QMainWindow):
             targets.append(f"папка «{s.save_dir}»")
         if s.save_to_docx:
             targets.append(f"документ «{Path(s.docx_path).name}»")
-        self._log(f"Мониторинг запущен: интервал {s.interval_sec:g} с, порог {s.threshold_percent:g} %, "
-                  f"снимать: {mode}, формат {s.image_format.upper()}, куда: {', '.join(targets)}",
-                  "success")
+        source = (f"окно {window_label(s.window_title, s.window_exe)}"
+                  if s.source_mode == SOURCE_WINDOW else "область экрана")
+        self._log(f"Мониторинг запущен: отслеживается {source}; интервал {s.interval_sec:g} с, "
+                  f"порог {s.threshold_percent:g} %, снимать: {mode}, формат {s.image_format.upper()}, "
+                  f"куда: {', '.join(targets)}", "success")
         self._monitor_started = datetime.now()
         self._arm_timer(announce=True)
         self._update_state()
@@ -843,6 +959,10 @@ class MainWindow(QMainWindow):
     def _on_region_selected(self, region: Region) -> None:
         self._finish_selection()
         self.settings.region = region
+        self.settings.source_mode = SOURCE_REGION
+        self._loading, was_loading = True, self._loading
+        self.region_radio.setChecked(True)
+        self._loading = was_loading
         self._update_region_label()
         self._settings_changed()
         self._log(f"Выбрана область: {region}")
@@ -859,11 +979,102 @@ class MainWindow(QMainWindow):
         self._start_after_select = False
 
     def highlight_region(self) -> None:
-        if self.settings.region is None:
+        """Подсвечивает отслеживаемую область или окно."""
+        s = self.settings
+        region = s.region
+        if s.source_mode == SOURCE_WINDOW:
+            if not s.has_window():
+                return
+            tracker = WindowTracker(s.window_title, s.window_class, s.window_exe)
+            state = tracker.update()
+            label = window_label(s.window_title, s.window_exe)
+            if state == MINIMIZED:
+                self._log(f"Окно {label} сейчас свёрнуто", "warning")
+                return
+            if state != FOUND:
+                self._log(f"Окно {label} сейчас не найдено (программа закрыта?)", "warning")
+                return
+            region = tracker.screen_region()
+            if region is not None:
+                region, _ = cropped_area(region, s.window_crop)
+        if region is None:
             return
-        self._highlighter = RegionHighlighter.show_region(self.settings.region)
+        self._highlighter = RegionHighlighter.show_region(region)
         if self._highlighter is None:
             self._log("Область находится за пределами подключённых экранов", "warning")
+
+    # ================================================================ Выбор окна
+
+    def select_window(self) -> None:
+        """Диалог выбора окна (как «Захват окна» в OBS)."""
+        if not WINDOW_CAPTURE_SUPPORTED:
+            QMessageBox.information(self, APP_NAME, "Захват окна доступен только в Windows.")
+            return
+        s = self.settings
+        current = (s.window_title, s.window_class, s.window_exe) if s.has_window() else None
+        dialog = WindowPickerDialog(self, current)
+        chosen = dialog.selected_window() if dialog.exec() == QDialog.DialogCode.Accepted else None
+        if chosen is None:
+            self._start_after_select = False
+            return
+        start = self._start_after_select
+        self._start_after_select = False
+        self._apply_window(chosen)
+        if dialog.crop_requested:
+            self.select_window_crop()
+        if start:
+            self.start_monitoring(interactive=not self._window_hidden())
+
+    def _apply_window(self, info: WindowInfo) -> None:
+        """Запоминает выбранное окно и переключается на режим «окно»."""
+        s = self.settings
+        if (info.exe.lower(), info.class_name) != (s.window_exe.lower(), s.window_class):
+            s.window_crop = None  # другое окно — прежняя область в нём не подходит
+        s.window_title, s.window_class, s.window_exe = info.title, info.class_name, info.exe
+        s.source_mode = SOURCE_WINDOW
+        self._loading, was_loading = True, self._loading
+        self.window_radio.setChecked(True)
+        self._loading = was_loading
+        self._update_region_label()
+        self._settings_changed()
+        self._log(f"Выбрано окно: {info.label()}")
+
+    def select_window_crop(self) -> None:
+        """Выбор части окна на его снимке (как «Обрезка» в OBS)."""
+        s = self.settings
+        if not s.has_window():
+            return
+        label = window_label(s.window_title, s.window_exe)
+        tracker = WindowTracker(s.window_title, s.window_class, s.window_exe)
+        state = tracker.update()
+        if state != FOUND:
+            reason = "свёрнуто — разверните его" if state == MINIMIZED else \
+                "не найдено — откройте программу"
+            QMessageBox.information(self, APP_NAME, f"Окно {label} {reason}, чтобы выбрать в нём область.")
+            return
+        frame = None if s.window_from_screen else tracker.capture()
+        if frame is None or not bgra_has_content(frame):
+            # Окно не отдаёт своё изображение — берём его с экрана
+            area = tracker.screen_region()
+            if area is not None:
+                with create_mss() as sct:
+                    frame = shot_to_array(sct.grab(area.as_mss()))
+        if frame is None:
+            QMessageBox.warning(self, APP_NAME, f"Не удалось получить изображение окна {label}.")
+            return
+        dialog = WindowCropDialog(self, frame, s.window_crop, label)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._set_window_crop(dialog.crop())
+
+    def reset_window_crop(self) -> None:
+        self._set_window_crop(None)
+
+    def _set_window_crop(self, crop) -> None:
+        self.settings.window_crop = crop
+        self._update_region_label()
+        self._settings_changed()
+        self._log(f"Отслеживается часть окна: {crop}" if crop else "Отслеживается всё окно")
 
     # ================================================================ Папка
 

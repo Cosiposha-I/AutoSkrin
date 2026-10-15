@@ -24,10 +24,15 @@ from typing import Any
 
 # Общие сведения о приложении (используются в UI, сборке и установщике)
 APP_NAME = "AutoSkrin"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.2.0"
+
+# Что отслеживать: область экрана или конкретное окно программы
+SOURCE_REGION = "region"
+SOURCE_WINDOW = "window"
+SOURCE_MODES = (SOURCE_REGION, SOURCE_WINDOW)
 
 # Режимы сохранения скриншота
-CAPTURE_REGION = "region"   # только выбранная область
+CAPTURE_REGION = "region"   # только выбранная область (или выбранное окно)
 CAPTURE_SCREEN = "screen"   # весь монитор, на котором находится область
 CAPTURE_ALL = "all"         # все мониторы целиком
 CAPTURE_MODES = (CAPTURE_REGION, CAPTURE_SCREEN, CAPTURE_ALL)
@@ -47,7 +52,8 @@ _OLD_DEFAULT_HOTKEY = "Ctrl+Shift+S"
 
 # Файл с настройками, выбранными в установщике (лежит рядом с AutoSkrin.exe)
 INSTALLER_DEFAULTS_FILE = "defaults.json"
-_INSTALLER_META_KEYS = ("install_id", "apply_to_existing", "region", "applied_defaults_id")
+_INSTALLER_META_KEYS = ("install_id", "apply_to_existing", "region", "applied_defaults_id",
+                        "source_mode", "window_title", "window_class", "window_exe", "window_crop")
 
 # Имя параметра автозапуска в реестре Windows
 _AUTORUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -146,11 +152,70 @@ class Region:
 
 
 @dataclass
+class Crop:
+    """
+    Часть окна, которую нужно отслеживать: отступы от краёв окна (его клиентской
+    области) в пикселях — как фильтр «Обрезка» в OBS. Отступы от краёв, а не
+    координаты, удобны тем, что при изменении размера окна выбранная часть растёт
+    и сжимается вместе с ним (панели программ обычно имеют постоянный размер).
+    """
+
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+    MIN_SIZE = 5  # меньше — окно слишком мало для выбранной части
+
+    def box(self, width: int, height: int) -> tuple[int, int, int, int] | None:
+        """(x, y, ширина, высота) выбранной части для окна заданного размера; None — не помещается."""
+        w = width - self.left - self.right
+        h = height - self.top - self.bottom
+        if w < self.MIN_SIZE or h < self.MIN_SIZE:
+            return None
+        return self.left, self.top, w, h
+
+    def is_whole(self) -> bool:
+        return not (self.left or self.top or self.right or self.bottom)
+
+    def __str__(self) -> str:
+        return (f"отступы слева {self.left}, сверху {self.top}, "
+                f"справа {self.right}, снизу {self.bottom} px")
+
+    @classmethod
+    def from_box(cls, x: int, y: int, w: int, h: int, width: int, height: int) -> Crop:
+        """Выделение (x, y, w, h) в окне размером width × height → отступы от краёв."""
+        x, y = max(0, x), max(0, y)
+        w, h = min(w, width - x), min(h, height - y)
+        return cls(x, y, max(0, width - x - w), max(0, height - y - h))
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Crop | None:
+        if not isinstance(data, dict):
+            return None
+        try:
+            crop = cls(*(int(data[k]) for k in ("left", "top", "right", "bottom")))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if min(crop.left, crop.top, crop.right, crop.bottom) < 0 or crop.is_whole():
+            return None
+        return crop
+
+
+@dataclass
 class Settings:
     """Все настройки приложения со значениями по умолчанию."""
 
     save_dir: str = field(default_factory=default_save_dir)
+    source_mode: str = SOURCE_REGION    # что отслеживать: область или окно
     region: Region | None = None
+
+    # Выбранное окно (запоминается так, чтобы найти его и после перезапуска программы)
+    window_title: str = ""
+    window_class: str = ""
+    window_exe: str = ""
+    window_from_screen: bool = False    # снимать окно с экрана, а не его содержимое
+    window_crop: Crop | None = None     # отслеживать только часть окна (None — всё окно)
     interval_sec: float = 1.0          # как часто проверять область
     threshold_percent: float = 1.0     # сколько % пикселей должно измениться
     pixel_tolerance: int = 12          # насколько (0–255) должен измениться пиксель
@@ -192,6 +257,7 @@ class Settings:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["region"] = asdict(self.region) if self.region else None
+        data["window_crop"] = asdict(self.window_crop) if self.window_crop else None
         return data
 
     @classmethod
@@ -226,10 +292,16 @@ class Settings:
             s.timer_at = f"{hours:02d}:{minutes:02d}"
         if isinstance(data.get("applied_defaults_id"), str):
             s.applied_defaults_id = data["applied_defaults_id"]
+        if data.get("source_mode") in SOURCE_MODES:
+            s.source_mode = data["source_mode"]
+        for key in ("window_title", "window_class", "window_exe"):
+            if isinstance(data.get(key), str):
+                setattr(s, key, data[key])
 
         # Логические флаги
         for key in ("notifications_enabled", "autostart_monitoring", "minimize_to_tray",
-                    "save_to_folder", "save_to_docx", "docx_captions", "timer_enabled"):
+                    "save_to_folder", "save_to_docx", "docx_captions", "timer_enabled",
+                    "window_from_screen"):
             if isinstance(data.get(key), bool):
                 setattr(s, key, data[key])
 
@@ -243,7 +315,12 @@ class Settings:
             setattr(s, key, min(max(value, lo), hi))
 
         s.region = Region.from_dict(data.get("region"))
+        s.window_crop = Crop.from_dict(data.get("window_crop"))
         return s
+
+    def has_window(self) -> bool:
+        """Выбрано ли окно для отслеживания."""
+        return bool(self.window_exe or self.window_title)
 
     def copy(self) -> Settings:
         """Независимая копия (передаётся в поток мониторинга)."""

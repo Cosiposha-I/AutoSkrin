@@ -7,7 +7,8 @@ monitor.py — логика отслеживания изменений в вы�
     save_image()             — сохранение PNG/JPG с временной меткой в имени;
     timer_deadline()         — когда остановить мониторинг по таймеру;
     ScreenMonitor            — поток QThread, который периодически
-                               захватывает область и сохраняет скриншоты
+                               захватывает область экрана или выбранное окно
+                               (см. window_capture.py) и сохраняет скриншоты
                                в папку и/или документ Word (см. word_doc.py).
 
 Работа с экраном идёт через mss в физических пикселях.
@@ -28,8 +29,10 @@ import numpy as np
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from settings import (CAPTURE_ALL, CAPTURE_REGION, CAPTURE_SCREEN, TIMER_AT, Region, Settings,
-                      parse_hhmm)
+from settings import (CAPTURE_ALL, CAPTURE_REGION, CAPTURE_SCREEN, SOURCE_WINDOW, TIMER_AT, Region,
+                      Settings, parse_hhmm)
+from window_capture import (FOUND, MINIMIZED, WindowTracker, bgra_has_content, crop_frame,
+                            cropped_area, window_label)
 from word_doc import ADDED_TO_WORD, PENDING, WordDocumentWriter
 
 log = logging.getLogger(__name__)
@@ -53,6 +56,12 @@ def shot_to_array(shot) -> np.ndarray:
 def shot_to_image(shot) -> Image.Image:
     """Снимок mss → изображение Pillow в RGB."""
     return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
+
+def bgra_to_image(frame: np.ndarray) -> Image.Image:
+    """Кадр numpy (высота × ширина × 4, BGRA) → изображение Pillow в RGB."""
+    height, width = frame.shape[:2]
+    return Image.frombytes("RGB", (width, height), np.ascontiguousarray(frame).tobytes(), "raw", "BGRX")
 
 
 def compute_change_percent(prev: np.ndarray, cur: np.ndarray, pixel_tolerance: int = 0) -> float:
@@ -250,6 +259,10 @@ class ScreenMonitor(QThread):
         self._stop_event = threading.Event()
         self._writer: WordDocumentWriter | None = None  # создаётся в потоке мониторинга
         self._busy_warned = False
+        self._tracker: WindowTracker | None = None       # отслеживаемое окно (режим «окно»)
+        self._window_state: str | None = None
+        self._black_warned = False
+        self._crop_warned = False
 
     # --- управление из GUI-потока ---
 
@@ -282,7 +295,7 @@ class ScreenMonitor(QThread):
     def _loop(self, sct) -> None:
         cfg = self._current_settings()
         detector = ChangeDetector(cfg.threshold_percent, cfg.pixel_tolerance, cfg.min_interval_sec)
-        region = cfg.region
+        source_key = None
         errors = 0
 
         while not self._stop_event.is_set():
@@ -290,30 +303,49 @@ class ScreenMonitor(QThread):
             cfg = self._current_settings()
             detector.configure(cfg.threshold_percent, cfg.pixel_tolerance, cfg.min_interval_sec)
 
-            if cfg.region is None:
-                self.fatal_error.emit("Не выбрана область для мониторинга.")
-                return
-            if cfg.region != region:
-                region = cfg.region
+            # Источник кадров: область экрана или окно программы
+            if cfg.source_mode == SOURCE_WINDOW:
+                if not cfg.has_window():
+                    self.fatal_error.emit("Не выбрано окно для мониторинга.")
+                    return
+                key = (SOURCE_WINDOW, cfg.window_title, cfg.window_class, cfg.window_exe,
+                       cfg.window_crop)
+            else:
+                if cfg.region is None:
+                    self.fatal_error.emit("Не выбрана область для мониторинга.")
+                    return
+                key = ("region", cfg.region)
+            if key != source_key:
+                if source_key is not None:
+                    self.log_message.emit(self._source_text(cfg), "info")
+                source_key = key
                 detector.reset()
-                self.log_message.emit(f"Новая область: {region}", "info")
+                self._tracker = (WindowTracker(cfg.window_title, cfg.window_class, cfg.window_exe)
+                                 if cfg.source_mode == SOURCE_WINDOW else None)
+                self._window_state = None
+                self._black_warned = False
+                self._crop_warned = False
 
-            # 1. Захват области
+            # 1. Захват кадра
             try:
-                shot = sct.grab(region.as_mss())
+                grabbed = self._grab(sct, cfg, detector)
                 errors = 0
             except Exception as exc:  # noqa: BLE001
                 errors += 1
                 self.log_message.emit(
-                    f"Ошибка захвата области ({errors}/{self.MAX_CAPTURE_ERRORS}): {exc}", "warning")
+                    f"Ошибка захвата ({errors}/{self.MAX_CAPTURE_ERRORS}): {exc}", "warning")
                 if errors >= self.MAX_CAPTURE_ERRORS:
-                    self.fatal_error.emit(f"Не удаётся захватить область экрана: {exc}")
+                    self.fatal_error.emit(f"Не удаётся захватить изображение: {exc}")
                     return
                 self._sleep(cfg.interval_sec, started)
                 continue
+            if grabbed is None:  # окно свёрнуто или закрыто — ждём
+                self._sleep(cfg.interval_sec, started)
+                continue
+            frame, area = grabbed
 
             # 2. Сравнение с предыдущим кадром
-            decision = detector.process(shot_to_array(shot), time.monotonic())
+            decision = detector.process(frame, time.monotonic())
             self.frame_checked.emit(decision.percent)
             if decision.deferred:
                 wait = detector.cooldown_left(time.monotonic())
@@ -324,7 +356,7 @@ class ScreenMonitor(QThread):
             # 3. Сохранение скриншота
             if decision.take_screenshot and not self._stop_event.is_set():
                 try:
-                    saved = self._save(sct, cfg, region, shot)
+                    saved = self._save(sct, cfg, area, frame)
                 except _FatalSaveError as exc:
                     self.fatal_error.emit(str(exc))
                     return
@@ -336,19 +368,82 @@ class ScreenMonitor(QThread):
 
             self._sleep(cfg.interval_sec, started)
 
-    def _save(self, sct, cfg: Settings, region: Region, region_shot) -> tuple[str, str]:
+    @staticmethod
+    def _source_text(cfg: Settings) -> str:
+        if cfg.source_mode == SOURCE_WINDOW:
+            part = f" (часть окна: {cfg.window_crop})" if cfg.window_crop else ""
+            return f"Отслеживается окно: {window_label(cfg.window_title, cfg.window_exe)}{part}"
+        return f"Новая область: {cfg.region}"
+
+    # --- захват кадра ---
+
+    def _grab(self, sct, cfg: Settings, detector: ChangeDetector) -> tuple[np.ndarray, Region | None] | None:
         """
-        Делает скриншот согласно режиму (область / экран / все мониторы) и
+        Кадр для сравнения (BGRA) и место источника на экране.
+        None — окно сейчас недоступно (свёрнуто или закрыто).
+        """
+        if self._tracker is None:
+            shot = sct.grab(cfg.region.as_mss())
+            return shot_to_array(shot), cfg.region
+        return self._grab_window(sct, cfg, detector)
+
+    def _grab_window(self, sct, cfg: Settings, detector: ChangeDetector):
+        tracker = self._tracker
+        previous = tracker.window
+        state = tracker.update()
+        label = tracker.window.label() if tracker.window else tracker.label()
+        if state != self._window_state:
+            if state == MINIMIZED:
+                self.log_message.emit(f"Окно {label} свёрнуто — жду, когда его развернут", "info")
+            elif state != FOUND:
+                self.log_message.emit(
+                    f"Окно {tracker.label()} не найдено (программа закрыта?) — жду, когда оно появится",
+                    "warning")
+            elif self._window_state is not None:
+                self.log_message.emit(f"Окно снова доступно: {label}", "info")
+            self._window_state = state
+        if state != FOUND:
+            return None
+        if previous is not None and previous.hwnd != tracker.window.hwnd:
+            detector.reset()  # это уже другое окно (программу перезапустили) — сравниваем заново
+
+        window_area = tracker.screen_region()
+        if window_area is None:
+            return None
+        # Выбранная часть окна на экране (если окно стало слишком маленьким — всё окно)
+        area, crop_ok = cropped_area(window_area, cfg.window_crop)
+        if not crop_ok and not self._crop_warned:
+            self._crop_warned = True
+            self.log_message.emit(
+                f"Окно {label} стало меньше выбранной в нём области — пока снимаю всё окно", "warning")
+
+        frame = None
+        if not cfg.window_from_screen:
+            full = tracker.capture()
+            # Полностью чёрный снимок: приложение не отдаёт своё содержимое
+            if full is not None and bgra_has_content(full):
+                frame, _ = crop_frame(full, cfg.window_crop)
+            elif not self._black_warned:
+                self._black_warned = True
+                self.log_message.emit(
+                    f"Окно {label} не отдаёт своё изображение — снимаю его с экрана "
+                    "(не перекрывайте его другими окнами)", "warning")
+        if frame is None:
+            frame = shot_to_array(sct.grab(area.as_mss()))
+        return frame, area
+
+    def _save(self, sct, cfg: Settings, area: Region | None, frame: np.ndarray) -> tuple[str, str]:
+        """
+        Делает скриншот согласно режиму (область/окно, экран, все мониторы) и
         сохраняет его в папку и/или документ Word.
         Возвращает (описание для журнала, путь для открытия по щелчку).
         """
-        if cfg.capture_mode == CAPTURE_SCREEN:
-            shot = sct.grab(find_monitor(sct.monitors, region))
+        if cfg.capture_mode == CAPTURE_SCREEN and area is not None:
+            image = shot_to_image(sct.grab(find_monitor(sct.monitors, area)))
         elif cfg.capture_mode == CAPTURE_ALL:
-            shot = sct.grab(sct.monitors[0])
+            image = shot_to_image(sct.grab(sct.monitors[0]))
         else:
-            shot = region_shot  # CAPTURE_REGION — сохраняем тот самый кадр, где нашли изменение
-        image = shot_to_image(shot)
+            image = bgra_to_image(frame)  # тот самый кадр, где нашли изменение
         when = datetime.now()
         parts: list[str] = []
         target = ""
@@ -434,7 +529,7 @@ class _FatalSaveError(Exception):
 
 
 __all__ = [
-    "CAPTURE_ALL", "CAPTURE_REGION", "CAPTURE_SCREEN", "ChangeDetector", "Decision",
+    "CAPTURE_ALL", "CAPTURE_REGION", "CAPTURE_SCREEN", "ChangeDetector", "Decision", "bgra_to_image",
     "ScreenMonitor", "compute_change_percent", "create_mss", "find_monitor", "format_duration",
     "make_screenshot_path", "save_image", "shot_to_array", "shot_to_image", "timer_deadline",
 ]

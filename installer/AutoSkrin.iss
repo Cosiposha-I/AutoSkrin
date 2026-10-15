@@ -2,7 +2,7 @@
 ; Установщик AutoSkrin (Inno Setup 6, https://jrsoftware.org/isinfo.php)
 ;
 ; Обычно собирается автоматически командой:  python tools\build.py
-; Вручную (после PyInstaller):               iscc /DMyAppVersion=1.1.2 installer\AutoSkrin.iss
+; Вручную (после PyInstaller):               iscc /DMyAppVersion=1.2.0 installer\AutoSkrin.iss
 ;
 ; Всё настраивается в мастере установки:
 ;   * для кого ставить: только для себя (без прав администратора) или для всех;
@@ -25,7 +25,7 @@
 
 #define MyAppName "AutoSkrin"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.1.2"
+  #define MyAppVersion "1.2.0"
 #endif
 #define MyAppExeName "AutoSkrin.exe"
 #define MyAppURL "https://github.com/Cosiposha-I/AutoSkrin"

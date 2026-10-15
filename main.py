@@ -202,8 +202,56 @@ def run_self_test(report_path: str) -> int:
                 f"уведомления={s.notifications_enabled}, автостарт={s.autostart_monitoring}, "
                 f"трей={s.minimize_to_tray}, область={s.region}, клавиша={s.hotkey}")
 
+    def window_capture():
+        import time
+
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QColor, QPalette
+        from PyQt6.QtWidgets import QWidget
+
+        from window_capture import WINDOW_CAPTURE_SUPPORTED, default_api
+        if not WINDOW_CAPTURE_SUPPORTED:
+            return "недоступен на этой системе (только Windows)"
+
+        def solid_window(title, color, geometry, on_top=False):
+            flags = Qt.WindowType.WindowStaysOnTopHint if on_top else Qt.WindowType.Window
+            w = QWidget(None, flags)
+            w.setWindowTitle(title)
+            palette = w.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor(*color))
+            w.setPalette(palette)
+            w.setAutoFillBackground(True)
+            w.setGeometry(*geometry)
+            w.show()
+            return w
+
+        # Зелёное окно полностью накрыто красным: в снимок должно попасть зелёное
+        target = solid_window("AutoSkrin self-test: окно", (20, 180, 60), (120, 120, 320, 200))
+        cover = solid_window("AutoSkrin self-test: перекрытие", (200, 30, 30), (80, 80, 420, 300), True)
+        try:
+            for _ in range(20):
+                app.processEvents()
+                time.sleep(0.05)
+            api = default_api()
+            info = next((w for w in api.list_windows(include_own=True)
+                         if w.title == "AutoSkrin self-test: окно"), None)
+            if info is None:
+                raise RuntimeError("тестовое окно не найдено в списке окон")
+            frame = api.capture(info.hwnd)
+            if frame is None:
+                raise RuntimeError("PrintWindow не смог снять окно")
+            b, g, r = (int(v) for v in frame[frame.shape[0] // 2, frame.shape[1] // 2, :3])
+            if not (g > 120 and r < 100):
+                raise RuntimeError(f"в снимке не то окно: цвет в центре R{r} G{g} B{b}")
+            return (f"перекрытое окно снято верно ({frame.shape[1]}×{frame.shape[0]}), "
+                    f"окон в списке: {len(api.list_windows())}")
+        finally:
+            target.close()
+            cover.close()
+
     check("захват экрана и сохранение файлов", grab)
     check("главное окно", window)
+    check("захват окна", window_capture)
     check("документ Word", word_document)
     check("разбор горячей клавиши", lambda: str(parse_hotkey("Ctrl+Alt+S")))
     check("настройки пользователя", user_settings)
